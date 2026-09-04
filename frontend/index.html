@@ -45,7 +45,6 @@
       </div>
     </section>
 
-    <!-- Acceptance Test Simulation Panel -->
     <section class="sim-panel">
       <div class="sim-header">
         <h3>Acceptance Test Simulation</h3>
@@ -63,7 +62,18 @@
       </div>
     </section>
 
-    <!-- Text Input Bar -->
+    <section class="evaluation-panel">
+      <div class="sim-header">
+        <h3>Live Evaluation</h3>
+        <span id="eval-summary" class="sim-subtitle">No completed interruption trials yet.</span>
+      </div>
+      <div class="sim-buttons">
+        <button id="eval-btn" class="btn btn-sim">✓ Mark current trial outcome</button>
+        <button id="export-eval-btn" class="btn btn-sim">⇩ Export evaluation JSON</button>
+      </div>
+      <p class="sim-subtitle">Measurements are recorded in this browser session. Export the JSON after real trials and use only observed values in the hackathon evidence.</p>
+    </section>
+
     <section class="input-panel">
       <form id="text-form" class="input-form">
         <input id="text-input" type="text" placeholder="Or type a command and hit Enter..." autocomplete="off" />
@@ -71,7 +81,6 @@
       </form>
     </section>
 
-    <!-- Transcript Section -->
     <section class="transcript-section">
       <div class="transcript-header">
         <h4>Live Conversation</h4>
