@@ -1,7 +1,8 @@
-import unittest
 import json
+import os
+import unittest
 import urllib.request
-import urllib.error
+
 
 class TestVOXInterruption(unittest.TestCase):
     def test_new_task_is_newer(self):
@@ -11,47 +12,62 @@ class TestVOXInterruption(unittest.TestCase):
         self.assertGreater(new_task_id, current_task_id)
 
     def test_stale_result_is_discarded(self):
-        """Any result whose task_id is less than current_task_id must be discarded."""
+        """A result for an inactive task must never be accepted for playback."""
         current_active_task_id = 2
         stale_task_id = 1
-        
-        # Simulating client logic: if task_id != current_active_task_id: discard
-        is_stale = (stale_task_id != current_active_task_id)
-        self.assertTrue(is_stale, "Task 1 should be recognized as stale when active task is 2")
+        self.assertNotEqual(stale_task_id, current_active_task_id)
 
     def test_interruption_state_machine(self):
-        """Simulate a user query being interrupted before response completes."""
+        """An interrupted task cannot win after a newer task becomes active."""
         active_task_id = 0
-        transcript = []
+        spoken = []
 
-        # Step 1: User asks query 1
         active_task_id += 1
         task_1_id = active_task_id
-        transcript.append(("user", "Find laptops under 60000", task_1_id))
 
-        # Step 2: User interrupts with query 2
+        # User changes the request before task 1 finishes.
         active_task_id += 1
         task_2_id = active_task_id
-        transcript.append(("user", "Actually, make it 50000", task_2_id))
 
-        # Simulating out-of-order backend responses arriving:
-        # Backend response 1 arrives late:
-        resp_1 = {"task_id": task_1_id, "text": "Here are laptops under 60000"}
-        if resp_1["task_id"] == active_task_id:
-            transcript.append(("vox", resp_1["text"], resp_1["task_id"]))
+        responses = [
+            {"task_id": task_1_id, "text": "Here are laptops under 60000"},
+            {"task_id": task_2_id, "text": "Here are laptops under 50000"},
+        ]
 
-        # Backend response 2 arrives:
-        resp_2 = {"task_id": task_2_id, "text": "Here are laptops under 50000"}
-        if resp_2["task_id"] == active_task_id:
-            transcript.append(("vox", resp_2["text"], resp_2["task_id"]))
+        for response in responses:
+            if response["task_id"] == active_task_id:
+                spoken.append(response["text"])
 
-        # Verify: VOX only spoke response 2, never response 1
-        vox_messages = [msg for sender, msg, _ in transcript if sender == "vox"]
-        self.assertEqual(len(vox_messages), 1)
-        self.assertEqual(vox_messages[0], "Here are laptops under 50000")
+        self.assertEqual(spoken, ["Here are laptops under 50000"])
 
+    def test_rapid_multiple_interruptions_only_latest_task_wins(self):
+        """Repeated changes of mind must leave only the latest task eligible."""
+        active_task_id = 0
+        task_ids = []
+        for _ in range(5):
+            active_task_id += 1
+            task_ids.append(active_task_id)
+
+        responses = [
+            {"task_id": task_id, "text": f"response-{task_id}"}
+            for task_id in reversed(task_ids)
+        ]
+        accepted = [r for r in responses if r["task_id"] == active_task_id]
+
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(accepted[0]["task_id"], 5)
+
+    def test_task_ids_are_unique_for_sequential_requests(self):
+        """Sequential requests must not reuse task IDs."""
+        task_ids = list(range(1, 11))
+        self.assertEqual(len(task_ids), len(set(task_ids)))
+
+    @unittest.skipUnless(
+        os.getenv("VOX_LIVE_TESTS") == "1",
+        "Set VOX_LIVE_TESTS=1 to run tests against a live local backend/Rime configuration.",
+    )
     def test_backend_health_endpoint(self):
-        """Verify the running backend server /health endpoint."""
+        """Verify the running backend /health endpoint."""
         url = "http://127.0.0.1:8000/health"
         req = urllib.request.Request(url, headers={"User-Agent": "VOX-Test"})
         with urllib.request.urlopen(req, timeout=5) as response:
@@ -59,29 +75,49 @@ class TestVOXInterruption(unittest.TestCase):
             data = json.loads(response.read().decode())
             self.assertTrue(data.get("ok"))
 
+    @unittest.skipUnless(
+        os.getenv("VOX_LIVE_TESTS") == "1",
+        "Set VOX_LIVE_TESTS=1 to run tests against a live local backend/Rime configuration.",
+    )
     def test_backend_chat_preserves_task_id(self):
-        """Verify the running backend returns the matching task_id in /chat."""
+        """Verify the live backend returns the matching task_id in /chat."""
         url = "http://127.0.0.1:8000/chat"
         payload = json.dumps({"text": "Find laptops under 60000", "task_id": 42}).encode()
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as response:
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=45) as response:
             self.assertEqual(response.status, 200)
             data = json.loads(response.read().decode())
             self.assertEqual(data.get("task_id"), 42)
             self.assertIn("text", data)
             self.assertIn("audio_base64", data)
 
+    @unittest.skipUnless(
+        os.getenv("VOX_LIVE_TESTS") == "1",
+        "Set VOX_LIVE_TESTS=1 to run tests against a live local backend/Rime configuration.",
+    )
     def test_backend_rime_audio_generation(self):
-        """Verify the running backend produces real Rime audio."""
+        """Verify the live backend returns Rime audio when configured."""
         url = "http://127.0.0.1:8000/chat"
         payload = json.dumps({"text": "Hello", "task_id": 99}).encode()
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
         with urllib.request.urlopen(req, timeout=45) as response:
             self.assertEqual(response.status, 200)
             data = json.loads(response.read().decode())
             self.assertEqual(data.get("task_id"), 99)
-            self.assertIsNotNone(data.get("audio_base64"), f"Expected audio_base64, got error: {data.get('rime_error')}")
+            self.assertIsNotNone(
+                data.get("audio_base64"),
+                f"Expected audio_base64, got error: {data.get('rime_error')}",
+            )
             self.assertEqual(data.get("audio_format"), "audio/mp3")
+
 
 if __name__ == "__main__":
     unittest.main()
