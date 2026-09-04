@@ -22,15 +22,63 @@ else:
 app=FastAPI(title='VOX API')
 app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_methods=['*'],allow_headers=['*'])
 class ChatRequest(BaseModel): text:str; task_id:int
+
+GENERIC_RESPONSES = {
+    'what can i help you with',
+    'how can i help you',
+    'how can i assist you',
+    'what can i do for you',
+    'how may i help you',
+}
+
+async def _ollama_generate(prompt: str, model: str) -> str:
+    async with httpx.AsyncClient(timeout=45) as c:
+        r=await c.post('http://127.0.0.1:11434/api/generate',json={'model':model,'prompt':prompt,'stream':False})
+        r.raise_for_status()
+        return r.json()['response'].strip()
+
 async def ask_ollama(text:str)->str:
-    prompt='You are VOX, a concise voice assistant. Answer naturally and briefly. User request: '+text
+    """Generate a direct answer to the user's request.
+
+    The prompt is deliberately explicit because small local models can otherwise
+    fall back to a generic assistant greeting instead of answering the question.
+    """
+    model = os.getenv('OLLAMA_MODEL', 'llama3.2:1b')
+    prompt = f'''You are VOX, a real-time voice assistant.
+
+Your job is to answer the user's CURRENT request directly. Do not greet the user.
+Do not say "What can I help you with?" or "How can I help?" unless the user
+literally asks for help choosing a task.
+
+Rules:
+- Answer the actual question or request in the user's message.
+- For factual questions, give the useful facts first.
+- For lists or recommendations, provide a concise list with the most relevant items.
+- If the request is ambiguous, ask one short clarification question instead of giving a generic greeting.
+- Never pretend you searched the web or used a tool when you did not.
+- Keep the response natural for speech: short sentences, no markdown tables, and no unnecessary preamble.
+
+User's current request:
+{text}
+
+VOX response:'''
     try:
-        async with httpx.AsyncClient(timeout=45) as c:
-            model = os.getenv('OLLAMA_MODEL', 'llama3.2:1b')
-            r=await c.post('http://127.0.0.1:11434/api/generate',json={'model':model,'prompt':prompt,'stream':False})
-            r.raise_for_status();return r.json()['response'].strip()
+        answer = await _ollama_generate(prompt, model)
+        normalized = ' '.join(answer.lower().split()).strip(' .!?')
+        if not answer or normalized in GENERIC_RESPONSES:
+            retry_prompt = f'''Answer this user request directly and concisely.
+Do NOT greet the user and do NOT ask what they need help with.
+If it is a factual question, answer it. If it asks for places or recommendations,
+name the relevant places and briefly explain why they matter.
+
+User request: {text}
+
+Direct answer:'''
+            answer = await _ollama_generate(retry_prompt, model)
+        return answer or "I couldn't generate an answer to that request."
     except Exception as e:
         return f"[Ollama Error: {type(e).__name__} - Could not connect to local Ollama service. Ensure 'ollama serve' is running.]"
+
 async def rime_tts(text: str):
     key = os.getenv('RIME_API_KEY', '').strip()
     endpoint = os.getenv('RIME_ENDPOINT', 'https://users.rime.ai/v1/rime-tts').strip()
