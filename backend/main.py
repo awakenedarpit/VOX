@@ -10,6 +10,8 @@ from fastapi import FastAPI, File, Form, UploadFile
 # pyrefly: ignore [missing-import]
 from fastapi.middleware.cors import CORSMiddleware
 # pyrefly: ignore [missing-import]
+from fastapi.staticfiles import StaticFiles
+# pyrefly: ignore [missing-import]
 from pydantic import BaseModel
 import httpx
 
@@ -52,7 +54,6 @@ async def search_products(text: str) -> list[dict]:
             r.raise_for_status()
         page=r.text
         items=[]
-        # DDG result markup is intentionally parsed defensively; this is a best-effort public-web lookup.
         for match in re.finditer(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', page, re.S|re.I):
             raw_url=html.unescape(match.group(1)); title=html.unescape(re.sub(r'<[^>]+>','',match.group(2))).strip()
             raw_url=unquote(raw_url)
@@ -182,3 +183,10 @@ async def transcribe(file: UploadFile=File(...),language: str=Form('en-IN')):
 async def chat(req: ChatRequest):
     text=await ask_ollama(req.text,req.language,req.session_id); audio_bytes,audio_format,rime_err=await rime_tts(text)
     return {'task_id':req.task_id,'text':text,'audio_base64':base64.b64encode(audio_bytes).decode() if audio_bytes else None,'audio_format':audio_format or 'audio/mp3','rime_error':rime_err}
+
+# Serve the VOX frontend from the same FastAPI origin. This removes the
+# separate 5500 -> 8000 browser-routing problem in Codespaces while keeping
+# /health, /transcribe and /chat above the static mount.
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / 'frontend'
+if FRONTEND_DIR.exists():
+    app.mount('/', StaticFiles(directory=FRONTEND_DIR, html=True), name='frontend')
