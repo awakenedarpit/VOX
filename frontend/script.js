@@ -17,6 +17,7 @@ const clearBtn = document.getElementById('clear-btn');
 const evalBtn = document.getElementById('eval-btn');
 const exportBtn = document.getElementById('export-eval-btn');
 const evalSummaryEl = document.getElementById('eval-summary');
+const languageSelect = document.getElementById('speech-language');
 
 let currentTaskId = 0;
 let currentState = 'IDLE';
@@ -30,18 +31,15 @@ let pendingRecovery = null;
 let activeResponseText = '';
 let ignoreRecognitionUntil = 0;
 let recognitionRestartTimer = null;
+let finalTranscriptBuffer = '';
+let finalTranscriptTimer = null;
+let lastSubmittedTranscript = '';
 
 const evaluationEvents = [];
 const interruptionTrials = [];
 
 function recordEvent(type, details = {}) {
-  const event = {
-    type,
-    time_ms: Number(performance.now().toFixed(3)),
-    task_id: currentTaskId,
-    state: currentState,
-    ...details,
-  };
+  const event = { type, time_ms: Number(performance.now().toFixed(3)), task_id: currentTaskId, state: currentState, ...details };
   evaluationEvents.push(event);
   updateEvaluationSummary();
   return event;
@@ -53,23 +51,15 @@ function updateEvaluationSummary() {
   const successes = completed.filter(t => t.recovery_success === true).length;
   const stale = completed.reduce((n, t) => n + Number(t.stale_results || 0), 0);
   const recoveryTimes = completed.map(t => t.recovery_time_ms).filter(Number.isFinite);
-  const avgRecovery = recoveryTimes.length
-    ? Math.round(recoveryTimes.reduce((a, b) => a + b, 0) / recoveryTimes.length)
-    : null;
+  const avgRecovery = recoveryTimes.length ? Math.round(recoveryTimes.reduce((a, b) => a + b, 0) / recoveryTimes.length) : null;
   const successRate = completed.length ? Math.round(successes / completed.length * 100) : null;
-  const staleRate = completed.length ? Math.round(stale / completed.length * 1000) / 10 : null;
   evalSummaryEl.textContent = completed.length
-    ? `Trials ${completed.length} · Recovery ${successRate}% · Stale ${staleRate}% · Avg recovery ${avgRecovery ?? '--'} ms`
+    ? `Trials ${completed.length} · Recovery ${successRate}% · Stale results ${stale} · Avg recovery ${avgRecovery ?? '--'} ms`
     : 'No completed interruption trials yet.';
 }
 
 function exportEvaluation() {
-  const payload = {
-    exported_at: new Date().toISOString(),
-    note: 'Browser-session evaluation data. Missing values are not zero.',
-    trials: interruptionTrials,
-    events: evaluationEvents,
-  };
+  const payload = { exported_at: new Date().toISOString(), note: 'Browser-session evaluation data. Missing values are not zero.', trials: interruptionTrials, events: evaluationEvents };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -100,8 +90,7 @@ function addMessage(sender, text, taskId, isInterrupted = false) {
   msg.className = `msg ${sender}` + (isInterrupted ? ' interrupted-tag' : '');
   const header = document.createElement('div');
   header.className = 'msg-header';
-  const senderLabel = sender === 'user' ? 'YOU' : 'VOX';
-  header.innerHTML = `<span>${senderLabel}</span><span>Task #${taskId || currentTaskId}</span>`;
+  header.innerHTML = `<span>${sender === 'user' ? 'YOU' : 'VOX'}</span><span>Task #${taskId || currentTaskId}</span>`;
   const body = document.createElement('div');
   body.textContent = text;
   if (isInterrupted) {
@@ -164,8 +153,7 @@ function beginInterruptionTrial(reason) {
   taskMetric.textContent = `#${currentTaskId}`;
   activeResponseText = '';
   bargeInHandledForTask = currentTaskId;
-  ignoreRecognitionUntil = performance.now() + 650;
-
+  ignoreRecognitionUntil = performance.now() + 450;
   pendingRecovery = {
     trial_id: interruptionTrials.length + 1,
     interrupted_task_id: previousTaskId,
@@ -189,39 +177,47 @@ function interrupt(reason = 'Interruption') {
   return beginInterruptionTrial(reason);
 }
 
+function normalizeForCompare(text) {
+  return text.toLowerCase().replace(/[^a-z0-9₹]+/g, ' ').trim();
+}
+
 function isLikelyAssistantEcho(text) {
-  const normalized = text.toLowerCase().replace(/[^a-z0-9₹]+/g, ' ').trim();
-  if (!normalized || !activeResponseText) return false;
-  const response = activeResponseText.toLowerCase().replace(/[^a-z0-9₹]+/g, ' ').trim();
-  if (!response) return false;
+  const normalized = normalizeForCompare(text);
+  const response = normalizeForCompare(activeResponseText);
+  if (!normalized || !response) return false;
   const words = normalized.split(/\s+/).filter(Boolean);
   if (words.length < 2) return false;
   const responseWords = new Set(response.split(/\s+/));
   const overlap = words.filter(w => responseWords.has(w)).length / words.length;
-  return response.includes(normalized) || normalized.includes(response.slice(0, Math.min(response.length, 80))) || overlap >= 0.85;
+  return response.includes(normalized) || normalized.includes(response.slice(0, Math.min(response.length, 80))) || overlap >= 0.9;
 }
 
 function shouldAcceptUserSpeech(text) {
-  const cleaned = text.trim();
-  if (!cleaned) return false;
-  if (performance.now() < ignoreRecognitionUntil) return false;
+  const cleaned = text.trim().replace(/\s+/g, ' ');
+  if (!cleaned || performance.now() < ignoreRecognitionUntil) return false;
   if (isLikelyAssistantEcho(cleaned)) {
     recordEvent('recognition_echo_ignored', { text_length: cleaned.length });
     return false;
   }
+  if (cleaned === lastSubmittedTranscript) return false;
   return true;
 }
 
+function getSelectedLanguage() {
+  return languageSelect?.value || 'en-IN';
+}
+
 async function sendQuery(text) {
-  const cleaned = text.trim();
-  if (!cleaned || performance.now() < ignoreRecognitionUntil) return;
+  const cleaned = text.trim().replace(/\s+/g, ' ');
+  if (!cleaned || performance.now() < ignoreRecognitionUntil || cleaned === lastSubmittedTranscript) return;
+  lastSubmittedTranscript = cleaned;
   clearError();
   const isRecoveryTask = pendingRecovery && pendingRecovery.new_task_id === currentTaskId && pendingRecovery.recovery_success === null;
   const taskId = isRecoveryTask ? currentTaskId : ++currentTaskId;
   taskMetric.textContent = `#${taskId}`;
   bargeInHandledForTask = null;
   activeResponseText = '';
-  recordEvent('task_created', { task_id_created: taskId, text_length: cleaned.length, recovery_task: isRecoveryTask });
+  recordEvent('task_created', { task_id_created: taskId, text_length: cleaned.length, recovery_task: isRecoveryTask, speech_language: getSelectedLanguage() });
   addMessage('user', cleaned, taskId);
   setState('THINKING', 'VOX is thinking...');
 
@@ -233,7 +229,7 @@ async function sendQuery(text) {
     const res = await fetch('http://127.0.0.1:8000/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: cleaned, task_id: taskId }),
+      body: JSON.stringify({ text: cleaned, task_id: taskId, language: getSelectedLanguage() }),
       signal: currentAbortController.signal,
     });
     if (!res.ok) throw new Error(`Server returned ${res.status}: ${await res.text()}`);
@@ -250,16 +246,14 @@ async function sendQuery(text) {
 
     activeResponseText = data.text || '';
     addMessage('vox', activeResponseText, taskId);
-    if (data.audio_base64) {
-      playRimeAudio(data.audio_base64, data.audio_format, taskId);
-    } else {
+    if (data.audio_base64) playRimeAudio(data.audio_base64, data.audio_format, taskId);
+    else {
       if (data.rime_error) console.warn('[VOX] Rime notice:', data.rime_error);
       speakFallbackVoice(activeResponseText, taskId);
     }
   } catch (err) {
-    if (err.name === 'AbortError') {
-      recordEvent('request_aborted', { aborted_task_id: taskId });
-    } else if (taskId === currentTaskId) {
+    if (err.name === 'AbortError') recordEvent('request_aborted', { aborted_task_id: taskId });
+    else if (taskId === currentTaskId) {
       showError(`Error: ${err.message}`);
       setState('IDLE', 'Could not reach backend. Verify backend is running.');
     }
@@ -313,7 +307,7 @@ function speakFallbackVoice(text, taskId) {
   }
   stopAudio();
   const utterance = new SpeechSynthesisUtterance(text);
-  utterance.rate = 1.05;
+  utterance.rate = 1.02;
   utterance.pitch = 1.0;
   utterance.onstart = () => {
     if (taskId !== currentTaskId) return;
@@ -338,7 +332,14 @@ function restartRecognitionSoon() {
   recognitionRestartTimer = setTimeout(() => {
     if (!isMicActive || recognitionRunning) return;
     try { recognition.start(); } catch (_) {}
-  }, 120);
+  }, 180);
+}
+
+function flushFinalTranscript() {
+  clearTimeout(finalTranscriptTimer);
+  const text = finalTranscriptBuffer.trim();
+  finalTranscriptBuffer = '';
+  if (text && shouldAcceptUserSpeech(text)) sendQuery(text);
 }
 
 function setupSpeechRecognition() {
@@ -350,44 +351,57 @@ function setupSpeechRecognition() {
   recognition = new SpeechRecognition();
   recognition.continuous = true;
   recognition.interimResults = true;
-  recognition.lang = 'en-IN';
+  recognition.maxAlternatives = 3;
+  recognition.lang = getSelectedLanguage();
 
   recognition.onstart = () => {
     recognitionRunning = true;
-    recordEvent('speech_recognition_started');
+    recordEvent('speech_recognition_started', { language: recognition.lang });
   };
 
   recognition.onspeechstart = () => {
-    if ((currentState === 'SPEAKING' || currentState === 'THINKING') && bargeInHandledForTask !== currentTaskId && performance.now() >= ignoreRecognitionUntil) {
-      recordEvent('speech_candidate_detected');
-    }
+    if ((currentState === 'SPEAKING' || currentState === 'THINKING') && performance.now() >= ignoreRecognitionUntil) recordEvent('speech_candidate_detected');
   };
 
   recognition.onresult = (event) => {
     let interimTranscript = '';
     let finalTranscript = '';
     for (let i = event.resultIndex; i < event.results.length; ++i) {
-      const transcript = event.results[i][0].transcript;
-      if (event.results[i].isFinal) finalTranscript += transcript;
-      else interimTranscript += transcript;
+      const result = event.results[i];
+      const transcript = result[0].transcript.trim();
+      if (result.isFinal) finalTranscript += `${transcript} `;
+      else interimTranscript += `${transcript} `;
     }
 
-    // Do not cut audio on speechstart alone. Chrome can report VOX's own audio
-    // as speech. Require a real transcript first and reject likely echo.
-    const candidate = (interimTranscript || finalTranscript).trim();
-    if ((currentState === 'SPEAKING' || currentState === 'THINKING') && candidate && bargeInHandledForTask !== currentTaskId && shouldAcceptUserSpeech(candidate)) {
-      bargeInHandledForTask = currentTaskId;
-      interrupt('Voice barge-in detected');
+    const interim = interimTranscript.trim();
+    const final = finalTranscript.trim();
+
+    // Barge-in is transcript-driven, not speechstart-driven, so VOX's own audio
+    // does not automatically interrupt itself. A short command such as "wait"
+    // is still enough to interrupt once the recognizer actually transcribes it.
+    if ((currentState === 'SPEAKING' || currentState === 'THINKING') && bargeInHandledForTask !== currentTaskId) {
+      const candidate = final || interim;
+      if (candidate && shouldAcceptUserSpeech(candidate)) {
+        bargeInHandledForTask = currentTaskId;
+        interrupt('Voice barge-in detected');
+      }
     }
 
-    if (finalTranscript.trim() && shouldAcceptUserSpeech(finalTranscript)) {
-      sendQuery(finalTranscript.trim());
+    if (final && shouldAcceptUserSpeech(final)) {
+      // Browser recognition can split one sentence into several final chunks.
+      // Wait briefly so VOX sends the whole utterance to Ollama instead of
+      // answering the first fragment.
+      finalTranscriptBuffer = `${finalTranscriptBuffer} ${final}`.trim();
+      clearTimeout(finalTranscriptTimer);
+      finalTranscriptTimer = setTimeout(flushFinalTranscript, 500);
     }
   };
 
   recognition.onerror = (event) => {
     recognitionRunning = false;
-    if (event.error !== 'no-speech' && event.error !== 'aborted') {
+    if (event.error === 'language-not-supported') {
+      showError(`Speech language ${getSelectedLanguage()} is not supported by this browser.`);
+    } else if (!['no-speech', 'aborted'].includes(event.error)) {
       console.warn('[VOX] Speech recognition error:', event.error);
       recordEvent('error', { message: `Speech recognition: ${event.error}` });
     }
@@ -405,13 +419,19 @@ function startListening() {
   if (!recognition) return;
   isMicActive = true;
   clearError();
-  setState('LISTENING', 'Listening... Start speaking.');
+  finalTranscriptBuffer = '';
+  lastSubmittedTranscript = '';
+  const desiredLanguage = getSelectedLanguage();
+  if (recognition.lang !== desiredLanguage) recognition.lang = desiredLanguage;
+  setState('LISTENING', `Listening in ${desiredLanguage}. Start speaking.`);
   try { if (!recognitionRunning) recognition.start(); } catch (_) {}
 }
 
 function stopListening() {
   isMicActive = false;
   clearTimeout(recognitionRestartTimer);
+  clearTimeout(finalTranscriptTimer);
+  flushFinalTranscript();
   if (recognitionRunning && recognition) {
     try { recognition.stop(); } catch (_) {}
   }
@@ -419,6 +439,15 @@ function stopListening() {
 }
 
 micBtn.addEventListener('click', () => isMicActive ? stopListening() : startListening());
+
+languageSelect?.addEventListener('change', () => {
+  if (!isMicActive || !recognition) return;
+  const wasRunning = recognitionRunning;
+  try { if (wasRunning) recognition.stop(); } catch (_) {}
+  recognition.lang = getSelectedLanguage();
+  if (wasRunning) setTimeout(() => { try { recognition.start(); } catch (_) {} }, 220);
+  recordEvent('speech_language_changed', { language: recognition.lang });
+});
 
 stopBtn.addEventListener('click', () => {
   if (currentState === 'SPEAKING' || currentState === 'THINKING') {
@@ -456,5 +485,4 @@ evalBtn?.addEventListener('click', () => {
 });
 
 exportBtn?.addEventListener('click', exportEvaluation);
-
 setState('IDLE', 'Ready. Ask VOX anything.');
