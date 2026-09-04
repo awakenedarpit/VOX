@@ -15,6 +15,9 @@ const simBtn2 = document.getElementById('sim-btn-2');
 const textForm = document.getElementById('text-form');
 const textInput = document.getElementById('text-input');
 const clearBtn = document.getElementById('clear-btn');
+const evalBtn = document.getElementById('eval-btn');
+const exportBtn = document.getElementById('export-eval-btn');
+const evalSummaryEl = document.getElementById('eval-summary');
 
 let currentTaskId = 0;
 let currentState = 'IDLE';
@@ -22,7 +25,61 @@ let isMicActive = false;
 let recognition = null;
 let activeAudio = null;
 let currentAbortController = null;
-let lastInterruptTime = null;
+let bargeInHandledForTask = null;
+let pendingRecovery = null;
+
+// Evaluation event log. Timestamps are performance.now() values and are only
+// used for relative timings within the current browser session.
+const evaluationEvents = [];
+const interruptionTrials = [];
+
+function recordEvent(type, details = {}) {
+  const event = {
+    type,
+    time_ms: Number(performance.now().toFixed(3)),
+    task_id: currentTaskId,
+    state: currentState,
+    ...details,
+  };
+  evaluationEvents.push(event);
+  updateEvaluationSummary();
+  return event;
+}
+
+function updateEvaluationSummary() {
+  if (!evalSummaryEl) return;
+  const completed = interruptionTrials.filter(t => t.recovery_success !== null);
+  const successes = completed.filter(t => t.recovery_success).length;
+  const stale = completed.reduce((n, t) => n + t.stale_results, 0);
+  const recoveryTimes = completed
+    .map(t => t.recovery_time_ms)
+    .filter(v => Number.isFinite(v));
+  const avgRecovery = recoveryTimes.length
+    ? Math.round(recoveryTimes.reduce((a, b) => a + b, 0) / recoveryTimes.length)
+    : null;
+  const successRate = completed.length ? Math.round((successes / completed.length) * 100) : null;
+  const staleRate = completed.length ? Math.round((stale / completed.length) * 1000) / 10 : null;
+
+  evalSummaryEl.textContent = completed.length
+    ? `Trials ${completed.length} · Recovery ${successRate}% · Stale ${staleRate}% · Avg recovery ${avgRecovery ?? '--'} ms`
+    : 'No completed interruption trials yet.';
+}
+
+function exportEvaluation() {
+  const payload = {
+    exported_at: new Date().toISOString(),
+    note: 'Browser-session evaluation data. Do not treat missing values as zero.',
+    trials: interruptionTrials,
+    events: evaluationEvents,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `vox-evaluation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 // UI State Updater
 function setState(state, hintText) {
@@ -30,10 +87,8 @@ function setState(state, hintText) {
   stateEl.textContent = state;
   hintEl.textContent = hintText || '';
   orb.className = 'orb ' + state.toLowerCase();
-  
-  // Show manual interrupt button if VOX is talking or thinking
   stopBtn.hidden = (state !== 'SPEAKING' && state !== 'THINKING');
-  
+
   if (state === 'LISTENING') {
     micBtn.classList.add('active');
     micBtn.textContent = '⏹️ Stop Listening';
@@ -43,19 +98,18 @@ function setState(state, hintText) {
       micBtn.textContent = '🎤 Start Listening';
     }
   }
+  recordEvent('state_changed', { new_state: state });
 }
 
-// Add message to transcript
 function addMessage(sender, text, taskId, isInterrupted = false) {
   const msg = document.createElement('div');
   msg.className = `msg ${sender}` + (isInterrupted ? ' interrupted-tag' : '');
 
   const header = document.createElement('div');
   header.className = 'msg-header';
-  
   const senderLabel = sender === 'user' ? 'YOU' : 'VOX';
   header.innerHTML = `<span>${senderLabel}</span><span>Task #${taskId || currentTaskId}</span>`;
-  
+
   const body = document.createElement('div');
   body.textContent = text;
   if (isInterrupted) {
@@ -71,6 +125,7 @@ function addMessage(sender, text, taskId, isInterrupted = false) {
 function showError(msg) {
   errEl.hidden = false;
   errEl.textContent = msg;
+  recordEvent('error', { message: msg });
 }
 
 function clearError() {
@@ -78,12 +133,11 @@ function clearError() {
   errEl.textContent = '';
 }
 
-// Immediate audio cutoff
 function stopAudio() {
   const t0 = performance.now();
   let stopped = false;
+  recordEvent('audio_stop_requested');
 
-  // 1. Stop HTML5 Audio if playing
   if (activeAudio) {
     activeAudio.pause();
     activeAudio.currentTime = 0;
@@ -91,79 +145,97 @@ function stopAudio() {
     stopped = true;
   }
 
-  // 2. Stop Browser SpeechSynthesis if speaking
   if (window.speechSynthesis && window.speechSynthesis.speaking) {
     window.speechSynthesis.cancel();
     stopped = true;
   }
 
-  // 3. Abort pending HTTP requests
   if (currentAbortController) {
     currentAbortController.abort();
     currentAbortController = null;
-    stopped = true;
   }
 
-  const duration = Math.max(1, Math.round(performance.now() - t0));
+  const duration = Math.max(1, Number((performance.now() - t0).toFixed(3)));
+  if (stopped) recordEvent('audio_stopped', { stop_duration_ms: duration });
   return { stopped, duration };
 }
 
-// Invalidate existing task and stop playback
-function interrupt(reason = 'Interruption') {
+function beginInterruptionTrial(reason) {
+  const detectedAt = performance.now();
+  const previousTaskId = currentTaskId;
   const { duration } = stopAudio();
   currentTaskId++;
   taskMetric.textContent = `#${currentTaskId}`;
-  latencyMetric.textContent = `${duration} ms`;
 
+  pendingRecovery = {
+    trial_id: interruptionTrials.length + 1,
+    interrupted_task_id: previousTaskId,
+    new_task_id: currentTaskId,
+    interruption_detected_at: detectedAt,
+    audio_stop_at: performance.now(),
+    cutoff_latency_ms: duration,
+    recovery_time_ms: null,
+    stale_results: 0,
+    recovery_success: null,
+    reason,
+  };
+  interruptionTrials.push(pendingRecovery);
+
+  recordEvent('interruption_detected', { reason, interrupted_task_id: previousTaskId });
+  recordEvent('task_invalidated', { invalidated_task_id: previousTaskId });
   setState('INTERRUPTED', `${reason}. Stale response discarded.`);
   return currentTaskId;
 }
 
-// Send user request to backend
+function interrupt(reason = 'Interruption') {
+  return beginInterruptionTrial(reason);
+}
+
 async function sendQuery(text) {
   clearError();
   const taskId = ++currentTaskId;
   taskMetric.textContent = `#${taskId}`;
-  
+  recordEvent('task_created', { task_id_created: taskId, text_length: text.length });
   addMessage('user', text, taskId);
   setState('THINKING', 'VOX is thinking...');
 
-  // Setup abort controller for this specific request
   if (currentAbortController) currentAbortController.abort();
   currentAbortController = new AbortController();
+  recordEvent('ollama_started');
 
   try {
     const res = await fetch('http://127.0.0.1:8000/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: text, task_id: taskId }),
-      signal: currentAbortController.signal
+      body: JSON.stringify({ text, task_id: taskId }),
+      signal: currentAbortController.signal,
     });
 
     if (!res.ok) throw new Error(`Server returned ${res.status}: ${await res.text()}`);
     const data = await res.json();
+    recordEvent('ollama_completed', { response_task_id: data.task_id });
 
-    // Stale check: if another request started in the meantime, discard this response
     if (taskId !== currentTaskId) {
       console.log(`[VOX] Discarding stale response from Task #${taskId}. Active task is #${currentTaskId}.`);
+      recordEvent('stale_result_discarded', { stale_task_id: taskId, active_task_id: currentTaskId });
+      const trial = interruptionTrials.find(t => t.new_task_id === currentTaskId && t.recovery_success === null);
+      if (trial) trial.stale_results += 1;
+      updateEvaluationSummary();
       return;
     }
 
     addMessage('vox', data.text, taskId);
 
-    // Speak audio (Rime audio if available, otherwise local browser voice fallback)
     if (data.audio_base64) {
       playRimeAudio(data.audio_base64, data.audio_format, taskId);
     } else {
-      if (data.rime_error) {
-        console.warn('[VOX] Rime notice:', data.rime_error);
-      }
+      if (data.rime_error) console.warn('[VOX] Rime notice:', data.rime_error);
       speakFallbackVoice(data.text, taskId);
     }
-
   } catch (err) {
     if (err.name === 'AbortError') {
       console.log(`[VOX] Request #${taskId} aborted due to interruption.`);
+      recordEvent('request_aborted', { aborted_task_id: taskId });
     } else if (taskId === currentTaskId) {
       showError(`Error: ${err.message}`);
       setState('IDLE', 'Could not reach backend. Verify backend is running.');
@@ -171,27 +243,41 @@ async function sendQuery(text) {
   }
 }
 
-// Play real Rime audio from Base64
+function markRecoveryPlaybackStarted(taskId) {
+  if (!pendingRecovery || pendingRecovery.new_task_id !== taskId) return;
+  pendingRecovery.recovery_time_ms = Number((performance.now() - pendingRecovery.interruption_detected_at).toFixed(3));
+  pendingRecovery.recovery_success = true;
+  recordEvent('new_audio_playback_started', { recovery_time_ms: pendingRecovery.recovery_time_ms });
+  updateEvaluationSummary();
+}
+
 function playRimeAudio(base64Data, audioFormat, taskId) {
   stopAudio();
   const mimeType = audioFormat || 'audio/mp3';
   activeAudio = new Audio(`data:${mimeType};base64,` + base64Data);
   setState('SPEAKING', 'VOX is speaking with official Rime voice. Interrupt anytime.');
+  recordEvent('rime_audio_received', { audio_format: mimeType });
 
   activeAudio.onended = () => {
     if (taskId === currentTaskId) {
       activeAudio = null;
+      recordEvent('task_completed', { completed_task_id: taskId });
       setState(isMicActive ? 'LISTENING' : 'IDLE', isMicActive ? 'Listening...' : 'Ready.');
     }
   };
 
-  activeAudio.play().catch(e => {
+  activeAudio.play().then(() => {
+    if (taskId === currentTaskId) {
+      recordEvent('audio_playback_started', { playback_task_id: taskId });
+      markRecoveryPlaybackStarted(taskId);
+    }
+  }).catch(e => {
     console.warn('[VOX] Audio play error:', e);
-    setState('IDLE', 'Audio playback error.');
+    recordEvent('error', { message: `Audio playback error: ${e.message}` });
+    if (taskId === currentTaskId) setState('IDLE', 'Audio playback error.');
   });
 }
 
-// Fallback TTS when Rime credentials are not yet configured
 function speakFallbackVoice(text, taskId) {
   if (!('speechSynthesis' in window)) {
     setState('IDLE', 'Rime unconfigured. Web speech not supported.');
@@ -205,26 +291,26 @@ function speakFallbackVoice(text, taskId) {
 
   utterance.onstart = () => {
     if (taskId === currentTaskId) {
+      recordEvent('audio_playback_started', { playback_task_id: taskId, provider: 'browser-fallback' });
+      markRecoveryPlaybackStarted(taskId);
       setState('SPEAKING', 'VOX is speaking. Speak or click Interrupt anytime.');
     }
   };
 
   utterance.onend = () => {
     if (taskId === currentTaskId) {
+      recordEvent('task_completed', { completed_task_id: taskId });
       setState(isMicActive ? 'LISTENING' : 'IDLE', isMicActive ? 'Listening...' : 'Ready.');
     }
   };
 
   utterance.onerror = () => {
-    if (taskId === currentTaskId) {
-      setState(isMicActive ? 'LISTENING' : 'IDLE', 'Ready.');
-    }
+    if (taskId === currentTaskId) setState(isMicActive ? 'LISTENING' : 'IDLE', 'Ready.');
   };
 
   window.speechSynthesis.speak(utterance);
 }
 
-// Speech Recognition & Barge-In
 function setupSpeechRecognition() {
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SpeechRecognition) {
@@ -237,9 +323,9 @@ function setupSpeechRecognition() {
   recognition.interimResults = true;
   recognition.lang = 'en-IN';
 
-  // Voice barge-in detection: speech started while VOX is speaking or thinking
   recognition.onspeechstart = () => {
-    if (currentState === 'SPEAKING' || currentState === 'THINKING') {
+    if ((currentState === 'SPEAKING' || currentState === 'THINKING') && bargeInHandledForTask !== currentTaskId) {
+      bargeInHandledForTask = currentTaskId;
       console.log('[VOX] Voice barge-in detected! Cutting off audio immediately.');
       interrupt('Voice barge-in detected');
     }
@@ -251,38 +337,28 @@ function setupSpeechRecognition() {
 
     for (let i = event.resultIndex; i < event.results.length; ++i) {
       const transcript = event.results[i][0].transcript;
-      if (event.results[i].isFinal) {
-        finalTranscript += transcript;
-      } else {
-        interimTranscript += transcript;
-      }
+      if (event.results[i].isFinal) finalTranscript += transcript;
+      else interimTranscript += transcript;
     }
 
-    // If interim words are detected while speaking, trigger immediate interrupt
-    if (interimTranscript && (currentState === 'SPEAKING' || currentState === 'THINKING')) {
+    if (interimTranscript && (currentState === 'SPEAKING' || currentState === 'THINKING') && bargeInHandledForTask !== currentTaskId) {
+      bargeInHandledForTask = currentTaskId;
       interrupt('Voice detected');
     }
 
-    // When user finishes speaking the utterance
-    if (finalTranscript.trim()) {
-      sendQuery(finalTranscript.trim());
-    }
+    if (finalTranscript.trim()) sendQuery(finalTranscript.trim());
   };
 
   recognition.onerror = (event) => {
     if (event.error !== 'no-speech' && event.error !== 'aborted') {
       console.warn('[VOX] Speech recognition error:', event.error);
+      recordEvent('error', { message: `Speech recognition: ${event.error}` });
     }
   };
 
   recognition.onend = () => {
-    // Keep listening if user hasn't explicitly clicked stop
     if (isMicActive) {
-      try {
-        recognition.start();
-      } catch (e) {
-        // already started or transitioning
-      }
+      try { recognition.start(); } catch (e) {}
     } else {
       setState('IDLE', 'Microphone paused.');
     }
@@ -292,15 +368,10 @@ function setupSpeechRecognition() {
 function startListening() {
   if (!recognition) setupSpeechRecognition();
   if (!recognition) return;
-
   isMicActive = true;
   clearError();
   setState('LISTENING', 'Listening... Start speaking.');
-  try {
-    recognition.start();
-  } catch (e) {
-    console.log('[VOX] Recognition start error or already running:', e);
-  }
+  try { recognition.start(); } catch (e) { console.log('[VOX] Recognition start error or already running:', e); }
 }
 
 function stopListening() {
@@ -311,13 +382,9 @@ function stopListening() {
   setState('IDLE', 'Click microphone or run a simulation step.');
 }
 
-// Event Listeners
 micBtn.addEventListener('click', () => {
-  if (isMicActive) {
-    stopListening();
-  } else {
-    startListening();
-  }
+  if (isMicActive) stopListening();
+  else startListening();
 });
 
 stopBtn.addEventListener('click', () => {
@@ -327,26 +394,19 @@ stopBtn.addEventListener('click', () => {
   }, 300);
 });
 
-// Acceptance Test Simulation Buttons
-simBtn1.addEventListener('click', () => {
-  sendQuery('Find laptops under ₹60,000');
-});
+simBtn1.addEventListener('click', () => sendQuery('Find laptops under ₹60,000'));
 
 simBtn2.addEventListener('click', () => {
-  // Simulate immediate interruption & new query
   interrupt('Interrupted with new query');
-  setTimeout(() => {
-    sendQuery('Actually, make it ₹50,000');
-  }, 100);
+  setTimeout(() => sendQuery('Actually, make it ₹50,000'), 100);
 });
 
-// Text Form Submission
 textForm.addEventListener('submit', (e) => {
   e.preventDefault();
   const text = textInput.value.trim();
   if (!text) return;
   textInput.value = '';
-  
+
   if (currentState === 'SPEAKING' || currentState === 'THINKING') {
     interrupt('New text command entered');
     setTimeout(() => sendQuery(text), 100);
@@ -360,12 +420,18 @@ clearBtn.addEventListener('click', () => {
   latencyMetric.textContent = '-- ms';
 });
 
-// Keyboard Shortcut: Escape to interrupt
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    interrupt('Escape key pressed');
-  }
+evalBtn?.addEventListener('click', () => {
+  const current = interruptionTrials.find(t => t.new_task_id === currentTaskId && t.recovery_success === null);
+  if (current) current.recovery_success = false;
+  recordEvent('evaluation_snapshot', { completed_trials: interruptionTrials.length });
+  updateEvaluationSummary();
 });
 
-// Initialize on page load
+exportBtn?.addEventListener('click', exportEvaluation);
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') interrupt('Escape key pressed');
+});
+
 setupSpeechRecognition();
+updateEvaluationSummary();
