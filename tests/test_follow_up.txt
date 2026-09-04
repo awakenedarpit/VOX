@@ -1,1 +1,0 @@
-Regression case: first request “Find laptops under ₹60,000”, interrupt while speaking, then say “Actually, make it ₹50,000”. VOX must preserve the laptop request context and apply only the new budget constraint.
