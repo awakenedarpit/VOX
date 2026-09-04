@@ -12,64 +12,23 @@
 <body>
   <main class="app">
     <header>
-      <div class="brand-group">
-        <span class="brand">VOX</span>
-        <span class="badge">Rime AI Track</span>
-      </div>
+      <div class="brand-group"><span class="brand">VOX</span><span class="badge">Rime AI Track</span></div>
       <div class="tagline">Interruptible Real-Time Voice Assistant</div>
     </header>
-
     <section class="hero">
-      <div id="orb" class="orb idle">
-        <span id="orb-icon">🎙️</span>
-        <div class="orb-ring"></div>
-      </div>
+      <div id="orb" class="orb idle"><span id="orb-icon">🎙️</span><div class="orb-ring"></div></div>
       <div id="state" class="state">IDLE</div>
       <p id="hint" class="hint">Groq Whisper listens for your speech, then Rime speaks the answer.</p>
-      <div class="controls">
-        <button id="mic" class="btn btn-primary">🎤 Start Listening</button>
-        <button id="stop" class="btn btn-danger" hidden>⚡ Interrupt VOX</button>
-      </div>
-      <div class="metrics-card">
-        <div class="metric"><span class="metric-label">Active Task:</span><span id="task-metric" class="metric-val">#0</span></div>
-        <div class="metric-divider"></div>
-        <div class="metric"><span class="metric-label">Interruption Cutoff Latency:</span><span id="latency-metric" class="metric-val">-- ms</span></div>
-      </div>
+      <div class="controls"><button id="mic" class="btn btn-primary">🎤 Start Listening</button><button id="stop" class="btn btn-danger" hidden>⚡ Interrupt VOX</button></div>
+      <div class="metrics-card"><div class="metric"><span class="metric-label">Active Task:</span><span id="task-metric" class="metric-val">#0</span></div><div class="metric-divider"></div><div class="metric"><span class="metric-label">Interruption Cutoff Latency:</span><span id="latency-metric" class="metric-val">-- ms</span></div></div>
     </section>
-
-    <section class="input-panel voice-settings">
-      <label for="speech-language">Speech language</label>
-      <select id="speech-language" aria-label="Speech recognition language">
-        <option value="en-IN" selected>English (India)</option>
-        <option value="en-US">English (US)</option>
-        <option value="hi-IN">Hindi (India)</option>
-      </select>
-      <span class="sim-subtitle">Whisper Large v3 uses the selected language plus VOX technical vocabulary context.</span>
-    </section>
-
-    <section class="sim-panel">
-      <div class="sim-header"><h3>Acceptance Test Simulation</h3><span class="sim-subtitle">Test real-time barge-in and task superseding</span></div>
-      <div class="sim-buttons">
-        <button id="sim-btn-1" class="btn btn-sim"><span class="step-badge">Step 1</span><span>"Find laptops under ₹60,000"</span></button>
-        <button id="sim-btn-2" class="btn btn-sim btn-sim-interrupt"><span class="step-badge step-interrupt">Step 2 (Interrupt)</span><span>"Actually, make it ₹50,000"</span></button>
-      </div>
-    </section>
-
-    <section class="evaluation-panel">
-      <div class="sim-header"><h3>Live Evaluation</h3><span id="eval-summary" class="sim-subtitle">No completed interruption trials yet.</span></div>
-      <div class="sim-buttons"><button id="eval-btn" class="btn btn-sim">✓ Mark current trial outcome</button><button id="export-eval-btn" class="btn btn-sim">⇩ Export evaluation JSON</button></div>
-      <p class="sim-subtitle">Measurements are recorded in this browser session. Export after real trials and use only observed values in the hackathon evidence.</p>
-    </section>
-
+    <section class="input-panel voice-settings"><label for="speech-language">Speech language</label><select id="speech-language" aria-label="Speech recognition language"><option value="en-IN" selected>English (India)</option><option value="en-US">English (US)</option><option value="hi-IN">Hindi (India)</option></select><span class="sim-subtitle">Whisper Large v3 uses the selected language plus VOX technical vocabulary context.</span></section>
+    <section class="sim-panel"><div class="sim-header"><h3>Acceptance Test Simulation</h3><span class="sim-subtitle">Test real-time barge-in and task superseding</span></div><div class="sim-buttons"><button id="sim-btn-1" class="btn btn-sim"><span class="step-badge">Step 1</span><span>"Find laptops under ₹60,000"</span></button><button id="sim-btn-2" class="btn btn-sim btn-sim-interrupt"><span class="step-badge step-interrupt">Step 2 (Interrupt)</span><span>"Actually, make it ₹50,000"</span></button></div></section>
+    <section class="evaluation-panel"><div class="sim-header"><h3>Live Evaluation</h3><span id="eval-summary" class="sim-subtitle">No completed interruption trials yet.</span></div><div class="sim-buttons"><button id="eval-btn" class="btn btn-sim">✓ Mark current trial outcome</button><button id="export-eval-btn" class="btn btn-sim">⇩ Export evaluation JSON</button></div><p class="sim-subtitle">Measurements are recorded in this browser session. Export after real trials and use only observed values in the hackathon evidence.</p></section>
     <section class="input-panel"><form id="text-form" class="input-form"><input id="text-input" type="text" placeholder="Or type a command and hit Enter..." autocomplete="off" /><button type="submit" class="btn btn-submit">Send</button></form></section>
-
-    <section class="transcript-section">
-      <div class="transcript-header"><h4>Live Conversation</h4><button id="clear-btn" class="btn-clear">Clear</button></div>
-      <div id="transcript" class="transcript"><div class="msg system">VOX is ready. Click "Start Listening", speak naturally, or use the Step 1 / Step 2 buttons.</div></div>
-    </section>
+    <section class="transcript-section"><div class="transcript-header"><h4>Live Conversation</h4><button id="clear-btn" class="btn-clear">Clear</button></div><div id="transcript" class="transcript"><div class="msg system">VOX is ready. Click "Start Listening", speak naturally, or use the Step 1 / Step 2 buttons.</div></div></section>
     <div id="error" class="error" hidden></div>
   </main>
   <script src="script.js"></script>
-  <script src="adaptive-vad.js"></script>
 </body>
 </html>
