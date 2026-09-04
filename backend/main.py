@@ -3,12 +3,11 @@ from pathlib import Path
 # pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 # pyrefly: ignore [missing-import]
-from fastapi import FastAPI
+from fastapi import FastAPI, File, Form, UploadFile
 # pyrefly: ignore [missing-import]
 from fastapi.middleware.cors import CORSMiddleware
 # pyrefly: ignore [missing-import]
 from pydantic import BaseModel
-# pyrefly: ignore [missing-import]
 import httpx
 
 _env_path = Path(__file__).resolve().parent.parent / '.env'
@@ -32,8 +31,36 @@ GENERIC_RESPONSES = {
 
 LANGUAGE_NAMES = {'en-IN': 'English (India)', 'en-US': 'English (US)', 'hi-IN': 'Hindi (India)'}
 
+VOX_ASR_PROMPT = (
+    'VOX technical vocabulary and spelling context: VS Code, Visual Studio Code, Git, GitHub, '
+    'GitHub Actions, API, REST API, Python, JavaScript, TypeScript, React, FastAPI, HTML, CSS, '
+    'Ollama, Rime, LiveKit, Whisper, Groq, laptop, tablet, Indore, Ujjain. '
+    'Preserve technical names, acronyms, numbers, currency, model names, and code terms.'
+)
+
+async def groq_transcribe(audio: bytes, filename: str, language: str) -> str:
+    key = os.getenv('GROQ_API_KEY', '').strip()
+    if not key or key == 'your_groq_api_key_here':
+        raise RuntimeError('GROQ_API_KEY is not configured in .env')
+    model = os.getenv('GROQ_STT_MODEL', 'whisper-large-v3').strip()
+    lang = language.split('-')[0].lower() if language else 'en'
+    data = {
+        'model': model,
+        'language': lang,
+        'prompt': VOX_ASR_PROMPT,
+        'response_format': 'json',
+        'temperature': '0',
+    }
+    files = {'file': (filename or 'vox.webm', audio, 'audio/webm')}
+    headers = {'Authorization': f'Bearer {key}'}
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post('https://api.groq.com/openai/v1/audio/transcriptions', data=data, files=files, headers=headers)
+        if r.status_code != 200:
+            detail = r.text[:300]
+            raise RuntimeError(f'Groq STT returned HTTP {r.status_code}: {detail}')
+        return (r.json().get('text') or '').strip()
+
 async def _installed_model(preferred: str) -> str:
-    """Prefer a stronger installed small model when VOX was left on the old 1B default."""
     if preferred and preferred not in {'auto', 'llama3.2:1b'}:
         return preferred
     try:
@@ -41,7 +68,6 @@ async def _installed_model(preferred: str) -> str:
             r = await c.get('http://127.0.0.1:11434/api/tags')
             r.raise_for_status()
             names = [m.get('name', '') for m in r.json().get('models', [])]
-        # Ordered by practical quality for a local voice assistant; use only what is installed.
         preferred_models = ['qwen2.5:7b', 'qwen2.5:3b', 'gemma3:4b', 'llama3.2:3b', 'llama3.1:8b', 'llama3.2:1b']
         for candidate in preferred_models:
             if candidate in names:
@@ -62,6 +88,18 @@ async def _ollama_chat(messages: list[dict], model: str) -> str:
         r.raise_for_status()
         return (r.json().get('message', {}).get('content') or '').strip()
 
+async def _groq_chat(messages: list[dict]) -> str:
+    key = os.getenv('GROQ_API_KEY', '').strip()
+    model = os.getenv('GROQ_LLM_MODEL', 'openai/gpt-oss-20b').strip()
+    if not key or key == 'your_groq_api_key_here':
+        raise RuntimeError('GROQ_API_KEY is not configured')
+    payload = {'model': model, 'messages': messages, 'temperature': 0.2, 'top_p': 0.9, 'max_completion_tokens': 500}
+    headers = {'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post('https://api.groq.com/openai/v1/chat/completions', json=payload, headers=headers)
+        r.raise_for_status()
+        return (r.json().get('choices', [{}])[0].get('message', {}).get('content') or '').strip()
+
 
 def _clean_voice_answer(answer: str) -> str:
     return answer.strip().replace('**', '').replace('__', '').replace('```', '').strip()
@@ -71,42 +109,38 @@ def _is_generic(answer: str) -> bool:
     normalized = ' '.join(answer.lower().split()).strip(' .!?')
     return not normalized or normalized in GENERIC_RESPONSES
 
-async def ask_ollama(text: str, language: str = 'en-IN') -> str:
-    """Answer the current request while compensating conservatively for ASR noise."""
-    configured_model = os.getenv('OLLAMA_MODEL', 'auto').strip()
-    model = await _installed_model(configured_model)
-    language_name = LANGUAGE_NAMES.get(language, language)
 
-    system = f'''You are VOX, a precise real-time voice assistant.
-The input below is a speech-recognition transcript, so it can contain small phonetic or
-homophone errors. Correct only obvious ASR mistakes when the intended meaning is clear.
-Never invent missing facts or silently change the user's request. Preserve proper nouns,
-place names, numbers, units, dates, and named entities exactly when they are clear.
+def _system_prompt(language: str) -> str:
+    language_name = LANGUAGE_NAMES.get(language, language)
+    return f'''You are VOX, a precise real-time voice assistant.
+The input is a speech-recognition transcript and may contain small phonetic or homophone errors.
+Correct only an obvious ASR mistake when the intended meaning is clear. Never invent missing facts.
+Preserve proper nouns, place names, numbers, units, dates, model names, acronyms, and code terms.
 If a critical word is genuinely unclear, ask one short clarification.
 
-Answer the CURRENT request directly. Never start with a generic greeting or an offer to help.
-Do not describe internal reasoning. Do not claim to have searched or used a tool unless a
-tool was actually used.
+Answer the CURRENT request directly. Never begin with a generic greeting or an offer to help.
+Do not describe hidden reasoning. Do not claim to have searched or used a tool unless one was used.
+The user's speech language is {language_name}. Understand mixed English/Hindi naturally.
+For voice output, use short natural sentences. Give the key answer first.'''
 
-The user's selected speech language is {language_name}. If the user mixes English and Hindi,
-understand the meaning rather than translating everything unless asked.
-
-For voice output, use short natural sentences and compact answers. For factual questions,
-give key facts first. For comparisons, state the comparison directly. For recommendations,
-give a useful shortlist with brief reasons.'''
-
-    messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': text.strip()}]
+async def ask_ollama(text: str, language: str = 'en-IN') -> str:
+    messages = [{'role': 'system', 'content': _system_prompt(language)}, {'role': 'user', 'content': text.strip()}]
     try:
-        answer = _clean_voice_answer(await _ollama_chat(messages, model))
+        use_groq = os.getenv('LLM_PROVIDER', 'ollama').strip().lower() == 'groq'
+        if use_groq:
+            answer = _clean_voice_answer(await _groq_chat(messages))
+        else:
+            model = await _installed_model(os.getenv('OLLAMA_MODEL', 'auto').strip())
+            answer = _clean_voice_answer(await _ollama_chat(messages, model))
         if _is_generic(answer):
-            retry_messages = [
-                {'role': 'system', 'content': 'Answer the user directly. No greeting and no generic offer of help. Correct only obvious ASR errors. Keep the answer concise and factual.'},
+            retry = [
+                {'role': 'system', 'content': _system_prompt(language) + '\nThis is a retry: answer the exact user sentence now. Do not say you are ready to help.'},
                 {'role': 'user', 'content': text.strip()},
             ]
-            answer = _clean_voice_answer(await _ollama_chat(retry_messages, model))
+            answer = _clean_voice_answer(await (_groq_chat(retry) if use_groq else _ollama_chat(retry, await _installed_model(os.getenv('OLLAMA_MODEL', 'auto').strip()))))
         return answer or "I couldn't generate a useful answer to that request."
     except Exception as e:
-        return f"[Ollama Error: {type(e).__name__} - Could not connect to local Ollama service. Ensure 'ollama serve' is running and that OLLAMA_MODEL is installed.]"
+        return f"[LLM Error: {type(e).__name__} - Check the configured {os.getenv('LLM_PROVIDER', 'ollama')} service and model.]"
 
 async def rime_tts(text: str):
     key = os.getenv('RIME_API_KEY', '').strip()
@@ -132,15 +166,24 @@ async def rime_tts(text: str):
                     return base64.b64decode(b64), 'audio/mp3', None
                 return None, None, f"Rime returned unexpected JSON format: {list(data.keys())}"
             except Exception:
-                if r.content:
-                    return r.content, 'audio/mp3', None
-                return None, None, 'Empty response received from Rime API'
+                return (r.content, 'audio/mp3', None) if r.content else (None, None, 'Empty response received from Rime API')
     except Exception as e:
         return None, None, f'Rime network error: {type(e).__name__} - {str(e)}'
 
 @app.get('/health')
 async def health():
-    return {'ok': True}
+    return {'ok': True, 'stt': os.getenv('STT_PROVIDER', 'browser'), 'llm': os.getenv('LLM_PROVIDER', 'ollama')}
+
+@app.post('/transcribe')
+async def transcribe(file: UploadFile = File(...), language: str = Form('en-IN')):
+    audio = await file.read()
+    if not audio:
+        return {'text': '', 'error': 'Empty audio'}
+    try:
+        text = await groq_transcribe(audio, file.filename or 'vox.webm', language)
+        return {'text': text, 'provider': 'groq', 'model': os.getenv('GROQ_STT_MODEL', 'whisper-large-v3')}
+    except Exception as e:
+        return {'text': '', 'error': str(e), 'provider': 'groq'}
 
 @app.post('/chat')
 async def chat(req: ChatRequest):
