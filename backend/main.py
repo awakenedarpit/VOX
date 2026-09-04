@@ -1,6 +1,5 @@
 import os, base64
 from pathlib import Path
-from typing import Optional
 # pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 # pyrefly: ignore [missing-import]
@@ -27,45 +26,45 @@ class ChatRequest(BaseModel):
     language: str = 'en-IN'
 
 GENERIC_RESPONSES = {
-    'what can i help you with',
-    'how can i help you',
-    'how can i assist you',
-    'what can i do for you',
-    'how may i help you',
-    'sure, how can i help you',
+    'what can i help you with', 'how can i help you', 'how can i assist you',
+    'what can i do for you', 'how may i help you', 'sure, how can i help you',
 }
 
-LANGUAGE_NAMES = {
-    'en-IN': 'English (India)',
-    'en-US': 'English (US)',
-    'hi-IN': 'Hindi (India)',
-}
+LANGUAGE_NAMES = {'en-IN': 'English (India)', 'en-US': 'English (US)', 'hi-IN': 'Hindi (India)'}
+
+async def _installed_model(preferred: str) -> str:
+    """Prefer a stronger installed small model when VOX was left on the old 1B default."""
+    if preferred and preferred not in {'auto', 'llama3.2:1b'}:
+        return preferred
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.get('http://127.0.0.1:11434/api/tags')
+            r.raise_for_status()
+            names = [m.get('name', '') for m in r.json().get('models', [])]
+        # Ordered by practical quality for a local voice assistant; use only what is installed.
+        preferred_models = ['qwen2.5:7b', 'qwen2.5:3b', 'gemma3:4b', 'llama3.2:3b', 'llama3.1:8b', 'llama3.2:1b']
+        for candidate in preferred_models:
+            if candidate in names:
+                return candidate
+        return names[0] if names else 'llama3.2:1b'
+    except Exception:
+        return 'llama3.2:1b'
 
 async def _ollama_chat(messages: list[dict], model: str) -> str:
     payload = {
         'model': model,
         'messages': messages,
         'stream': False,
-        'options': {
-            'temperature': 0.2,
-            'top_p': 0.9,
-            'repeat_penalty': 1.08,
-            'num_ctx': 4096,
-        },
+        'options': {'temperature': 0.2, 'top_p': 0.9, 'repeat_penalty': 1.08, 'num_ctx': 4096},
     }
     async with httpx.AsyncClient(timeout=45) as c:
         r = await c.post('http://127.0.0.1:11434/api/chat', json=payload)
         r.raise_for_status()
-        data = r.json()
-        return (data.get('message', {}).get('content') or '').strip()
+        return (r.json().get('message', {}).get('content') or '').strip()
 
 
 def _clean_voice_answer(answer: str) -> str:
-    answer = answer.strip()
-    # Small local models sometimes wrap an otherwise good spoken answer in markdown.
-    answer = answer.replace('**', '').replace('__', '')
-    answer = answer.replace('```', '')
-    return answer.strip()
+    return answer.strip().replace('**', '').replace('__', '').replace('```', '').strip()
 
 
 def _is_generic(answer: str) -> bool:
@@ -74,37 +73,34 @@ def _is_generic(answer: str) -> bool:
 
 async def ask_ollama(text: str, language: str = 'en-IN') -> str:
     """Answer the current request while compensating conservatively for ASR noise."""
-    model = os.getenv('OLLAMA_MODEL', 'llama3.2:3b')
+    configured_model = os.getenv('OLLAMA_MODEL', 'auto').strip()
+    model = await _installed_model(configured_model)
     language_name = LANGUAGE_NAMES.get(language, language)
 
     system = f'''You are VOX, a precise real-time voice assistant.
-The input below is a speech-recognition transcript, so it can contain small phonetic
-or homophone errors. Correct only obvious ASR mistakes when the intended meaning is
-clear from context. Never invent missing facts or silently change the user's request.
-Preserve proper nouns, place names, numbers, units, dates, and named entities exactly
-when they are clear. If a critical word is genuinely unclear, ask one short clarification.
+The input below is a speech-recognition transcript, so it can contain small phonetic or
+homophone errors. Correct only obvious ASR mistakes when the intended meaning is clear.
+Never invent missing facts or silently change the user's request. Preserve proper nouns,
+place names, numbers, units, dates, and named entities exactly when they are clear.
+If a critical word is genuinely unclear, ask one short clarification.
 
-Answer the CURRENT request directly. Never start with a generic greeting or "What can I
-help you with?". Do not describe your internal reasoning. Do not claim to have searched
-or used a tool unless a tool was actually used.
+Answer the CURRENT request directly. Never start with a generic greeting or an offer to help.
+Do not describe internal reasoning. Do not claim to have searched or used a tool unless a
+tool was actually used.
 
-The user's selected speech language is {language_name}. If the user speaks a mix of
-English and Hindi, understand the meaning rather than translating everything unless asked.
+The user's selected speech language is {language_name}. If the user mixes English and Hindi,
+understand the meaning rather than translating everything unless asked.
 
-For voice output: use short natural sentences, pronounceable punctuation, and compact
-answers. For factual questions, give the key facts first. For comparisons, state the
-comparison directly. For recommendations, give a useful shortlist with brief reasons.'''
+For voice output, use short natural sentences and compact answers. For factual questions,
+give key facts first. For comparisons, state the comparison directly. For recommendations,
+give a useful shortlist with brief reasons.'''
 
-    messages = [
-        {'role': 'system', 'content': system},
-        {'role': 'user', 'content': text.strip()},
-    ]
-
+    messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': text.strip()}]
     try:
         answer = _clean_voice_answer(await _ollama_chat(messages, model))
         if _is_generic(answer):
             retry_messages = [
-                {'role': 'system', 'content': 'Answer the user directly. No greeting. No generic offer of help. If the transcript contains an obvious speech-recognition error, infer the correction only when context makes it clear. Keep the answer concise and factual.'},
+                {'role': 'system', 'content': 'Answer the user directly. No greeting and no generic offer of help. Correct only obvious ASR errors. Keep the answer concise and factual.'},
                 {'role': 'user', 'content': text.strip()},
             ]
             answer = _clean_voice_answer(await _ollama_chat(retry_messages, model))
@@ -117,13 +113,10 @@ async def rime_tts(text: str):
     endpoint = os.getenv('RIME_ENDPOINT', 'https://users.rime.ai/v1/rime-tts').strip()
     model = os.getenv('RIME_MODEL', 'coda').strip()
     speaker = os.getenv('RIME_SPEAKER', 'celeste').strip()
-
     if not key or key == 'your_rime_api_key_here':
         return None, None, 'RIME_API_KEY is not configured in .env'
-
     headers = {'Authorization': f'Bearer {key}', 'Content-Type': 'application/json', 'Accept': 'audio/mp3'}
     payload = {'modelId': model, 'speaker': speaker, 'text': text, 'lang': 'en'}
-
     try:
         async with httpx.AsyncClient(timeout=45) as c:
             r = await c.post(endpoint, json=payload, headers=headers)
@@ -153,10 +146,4 @@ async def health():
 async def chat(req: ChatRequest):
     text = await ask_ollama(req.text, req.language)
     audio_bytes, audio_format, rime_err = await rime_tts(text)
-    return {
-        'task_id': req.task_id,
-        'text': text,
-        'audio_base64': base64.b64encode(audio_bytes).decode() if audio_bytes else None,
-        'audio_format': audio_format or 'audio/mp3',
-        'rime_error': rime_err,
-    }
+    return {'task_id': req.task_id, 'text': text, 'audio_base64': base64.b64encode(audio_bytes).decode() if audio_bytes else None, 'audio_format': audio_format or 'audio/mp3', 'rime_error': rime_err}
