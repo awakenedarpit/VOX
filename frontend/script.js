@@ -10,10 +10,21 @@ const textForm = $('text-form'), textInput = $('text-input'), clearBtn = $('clea
 const evalBtn = $('eval-btn'), exportBtn = $('export-eval-btn'), evalSummaryEl = $('eval-summary');
 const languageSelect = $('speech-language');
 
-// In local Chrome this becomes http://127.0.0.1:8000.
-// In a remote workspace/preview, use the same hostname as the frontend so
-// 127.0.0.1 does not incorrectly point at the browser's own machine.
-const API_BASE = window.VOX_API_BASE || `${window.location.protocol}//${window.location.hostname}:8000`;
+// Resolve the API correctly in both local Chrome and remote Codespaces.
+// Codespaces forwards each port using a hostname containing the port number,
+// e.g. ...-5500.app.github.dev -> ...-8000.app.github.dev.
+function resolveApiBase() {
+  if (window.VOX_API_BASE) return window.VOX_API_BASE.replace(/\/$/, '');
+  const host = window.location.hostname;
+  if (host === 'localhost' || host === '127.0.0.1' || host === '[::1]') {
+    return `${window.location.protocol}//${host}:8000`;
+  }
+  const remoteHost = host.replace(/-\d+(?=\.)/, '-8000');
+  if (remoteHost !== host) return `${window.location.protocol}//${remoteHost}`;
+  return `${window.location.protocol}//${host}:8000`;
+}
+const API_BASE = resolveApiBase();
+
 let currentTaskId = 0;
 let currentState = 'IDLE';
 let isMicActive = false;
@@ -174,7 +185,7 @@ async function sendQuery(text) {
     if (err.name === 'AbortError') recordEvent('request_aborted', { aborted_task_id: taskId });
     else if (taskId === currentTaskId) {
       const detail = err instanceof TypeError && err.message === 'Failed to fetch'
-        ? `Cannot connect to VOX backend at ${API_BASE}. Start FastAPI on port 8000 and keep it running.`
+        ? `Cannot connect to VOX backend at ${API_BASE}. Make sure port 8000 is running and forwarded.`
         : `Error: ${err.message}`;
       showError(detail);
       setState(isMicActive ? 'LISTENING' : 'IDLE', 'Backend connection failed.');
@@ -258,43 +269,40 @@ function setupSpeechRecognition() {
     if (finalText.trim() && performance.now() >= ignoreRecognitionUntil) {
       finalBuffer = `${finalBuffer} ${finalText.trim()}`.trim();
       clearTimeout(finalTimer);
-      finalTimer = setTimeout(flushFinal, 350);
+      finalTimer = setTimeout(flushFinal, 300);
     }
+    if (interim && hintEl && currentState === 'LISTENING') hintEl.textContent = interim;
   };
   return true;
 }
 
-async function toggleMic() {
+function startListening() {
   clearError();
   if (!recognition && !setupSpeechRecognition()) return;
-  if (isMicActive) {
-    isMicActive = false;
-    clearTimeout(restartTimer);
-    recognition?.abort();
-    recognitionRunning = false;
-    setState('IDLE', 'Listening stopped.');
-    return;
-  }
   isMicActive = true;
   recognition.lang = language();
-  try {
-    recognition.start();
-    setState('LISTENING', 'Listening… speak naturally.');
-  } catch (err) {
-    isMicActive = false;
-    showError(`Could not start speech recognition: ${err.message}`);
-    setState('IDLE', 'Ready.');
-  }
+  setState('LISTENING', 'Listening… speak normally.');
+  try { if (!recognitionRunning) recognition.start(); } catch (_) { restartRecognition(); }
 }
 
-if (micBtn) micBtn.addEventListener('click', toggleMic);
-if (stopBtn) stopBtn.addEventListener('click', () => interrupt('Manual interruption'));
-if (clearBtn) clearBtn.addEventListener('click', () => { transcriptEl.innerHTML = ''; });
-if (exportBtn) exportBtn.addEventListener('click', exportEvaluation);
-if (evalBtn) evalBtn.addEventListener('click', () => { updateEvaluationSummary(); });
-if (simBtn1) simBtn1.addEventListener('click', () => { if (currentState === 'SPEAKING' || currentState === 'THINKING') interrupt('Simulation: budget changed'); sendQuery('Find laptops under 50000 rupees.'); });
-if (simBtn2) simBtn2.addEventListener('click', () => { if (currentState === 'SPEAKING' || currentState === 'THINKING') interrupt('Simulation: user changed requirement'); sendQuery('Actually, make the budget 50000 rupees and keep everything else the same.'); });
-if (textForm) textForm.addEventListener('submit', (e) => { e.preventDefault(); const text = textInput.value.trim(); if (text) { textInput.value = ''; sendQuery(text); } });
-if (languageSelect) languageSelect.addEventListener('change', () => { if (recognition) recognition.lang = language(); });
+function stopListening() {
+  isMicActive = false;
+  clearTimeout(restartTimer); clearTimeout(finalTimer);
+  finalBuffer = '';
+  if (recognition) { try { recognition.stop(); } catch (_) {} }
+  recognitionRunning = false;
+  stopAudio();
+  setState('IDLE', 'Ready.');
+}
 
-setState('IDLE', 'Ready. Click Start Listening to talk to VOX.');
+if (micBtn) micBtn.addEventListener('click', () => isMicActive ? stopListening() : startListening());
+if (stopBtn) stopBtn.addEventListener('click', () => interrupt());
+if (clearBtn) clearBtn.addEventListener('click', () => { if (transcriptEl) transcriptEl.innerHTML = ''; clearError(); });
+if (languageSelect) languageSelect.addEventListener('change', () => { if (recognition) recognition.lang = language(); });
+if (evalBtn) evalBtn.addEventListener('click', () => { const last = interruptionTrials[interruptionTrials.length - 1]; if (last && last.recovery_success === null) { last.recovery_success = true; updateEvaluationSummary(); } });
+if (exportBtn) exportBtn.addEventListener('click', exportEvaluation);
+if (simBtn1) simBtn1.addEventListener('click', () => sendQuery('Find laptops under sixty thousand rupees.'));
+if (simBtn2) simBtn2.addEventListener('click', () => { if (currentState === 'SPEAKING' || currentState === 'THINKING') beginInterruption('Simulation interruption'); sendQuery('Actually, make it fifty thousand rupees.'); });
+if (textForm) textForm.addEventListener('submit', (e) => { e.preventDefault(); const text = textInput?.value || ''; if (currentState === 'SPEAKING' || currentState === 'THINKING') beginInterruption('Text interruption'); sendQuery(text); if (textInput) textInput.value = ''; });
+
+setState('IDLE', 'Ready. Start listening when you are ready.');
