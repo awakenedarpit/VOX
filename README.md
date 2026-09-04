@@ -1,0 +1,44 @@
+# VOX — Interruptible Real-Time AI Voice Assistant
+
+VOX is a voice-native prototype focused on **interruption and recovery**.
+
+Flow: microphone → speech recognition → FastAPI → AI → Rime TTS → audio.
+
+## Core behavior
+When the user changes a request while VOX is responding, the old task is invalidated and its result must not be played.
+
+## Setup
+Requirements: Python 3.10+, Chrome recommended, Ollama for local AI, and Rime access for real voice output.
+
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload
+```
+
+Serve the frontend:
+```bash
+cd frontend
+python3 -m http.server 5500
+```
+Open `http://127.0.0.1:5500`.
+
+Copy `.env.example` to `.env` and add real Rime configuration. Never commit `.env`.
+
+## Verified Rime Configuration
+- Endpoint: `https://users.rime.ai/v1/rime-tts`
+- Model ID: `coda`
+- Speaker: `celeste`
+- Audio Format: `audio/mp3` (160 kbps, 24 kHz)
+- Transport: HTTP/POST (`Accept: audio/mp3`, `Authorization: Bearer <RIME_API_KEY>`)
+
+## Acceptance test
+Ask “Find laptops under ₹60,000.” Let VOX speak, then interrupt with “Actually, make it ₹50,000.” Verify old audio stops, the newer request wins, and no stale result is spoken.
+
+## Running Tests
+Run the comprehensive test suite verifying task monotonicity, interruption cutoff, and live Rime TTS:
+```bash
+./backend/.venv/bin/python -m unittest tests/test_interruption.py
+```
