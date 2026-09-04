@@ -1,4 +1,4 @@
-import os, base64
+import os, base64, re, html
 from pathlib import Path
 from collections import deque
 
@@ -13,10 +13,8 @@ from pydantic import BaseModel
 import httpx
 
 _env_path = Path(__file__).resolve().parent.parent / '.env'
-if _env_path.exists():
-    load_dotenv(dotenv_path=_env_path, override=True)
-else:
-    load_dotenv(override=True)
+if _env_path.exists(): load_dotenv(dotenv_path=_env_path, override=True)
+else: load_dotenv(override=True)
 
 app = FastAPI(title='VOX API')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
@@ -27,233 +25,151 @@ class ChatRequest(BaseModel):
     language: str = 'en-IN'
     session_id: str = 'local-demo'
 
-GENERIC_RESPONSES = {
-    'what can i help you with', 'how can i help you', 'how can i assist you',
-    'what can i do for you', 'how may i help you', 'sure, how can i help you',
-}
-
-LANGUAGE_NAMES = {'en-IN': 'English (India)', 'en-US': 'English (US)', 'hi-IN': 'Hindi (India)'}
-
-VOX_ASR_PROMPT = (
-    'VOX technical vocabulary and spelling context: VS Code, Visual Studio Code, Git, GitHub, '
-    'GitHub Actions, API, REST API, Python, JavaScript, TypeScript, React, FastAPI, HTML, CSS, '
-    'Ollama, Rime, LiveKit, Whisper, Groq, laptop, tablet, Indore, Ujjain. '
-    'Preserve technical names, acronyms, numbers, currency, model names, and code terms.'
-)
-
-# Short-lived conversational memory. It lets a barge-in follow-up such as
-# “Actually, make it 50,000” modify the request that was just interrupted.
-# The frontend can provide a session_id so different browser sessions stay isolated.
+GENERIC_RESPONSES = {'what can i help you with','how can i help you','how can i assist you','what can i do for you','how may i help you','sure, how can i help you'}
+LANGUAGE_NAMES = {'en-IN':'English (India)','en-US':'English (US)','hi-IN':'Hindi (India)'}
+VOX_ASR_PROMPT = ('VOX technical vocabulary and spelling context: VS Code, Visual Studio Code, Git, GitHub, GitHub Actions, API, REST API, Python, JavaScript, TypeScript, React, FastAPI, HTML, CSS, Ollama, Rime, LiveKit, Whisper, Groq, laptop, tablet, Indore, Ujjain. Preserve technical names, acronyms, numbers, currency, model names, and code terms.')
 conversation_memory: dict[str, deque] = {}
+FOLLOW_UP_MARKERS = ('actually','instead','make it','change it','change that','update it','keep everything else','same thing','same one','under ','below ','increase it','decrease it','raise it','lower it','remove that','add that','add it','only change','change the budget','change the price')
 
-FOLLOW_UP_MARKERS = (
-    'actually', 'instead', 'make it', 'change it', 'change that', 'update it',
-    'keep everything else', 'same thing', 'same one', 'under ', 'below ',
-    'increase it', 'decrease it', 'raise it', 'lower it', 'remove that',
-    'add that', 'add it', 'only change', 'change the budget', 'change the price',
-)
+PRODUCT_TERMS = ('laptop','notebook','macbook','chromebook','tablet','phone','smartphone','monitor','headphones','earbuds','keyboard','mouse','camera','tv','television','watch','smartwatch')
+SHOPPING_TERMS = ('find','search','recommend','best','buy','price','cost','under','below','budget','cheapest','available','deal','deals','for sale')
 
+def is_follow_up(text):
+    n=' '.join(text.lower().split()); return any(n.startswith(m) or f' {m}' in n for m in FOLLOW_UP_MARKERS)
 
-def is_follow_up(text: str) -> bool:
-    normalized = ' '.join(text.lower().split())
-    return any(normalized.startswith(marker) or f' {marker}' in normalized for marker in FOLLOW_UP_MARKERS)
+def is_product_request(text):
+    n=text.lower(); return any(t in n for t in PRODUCT_TERMS) and any(t in n for t in SHOPPING_TERMS)
 
+def product_search_query(text):
+    n=' '.join(text.split())
+    # Keep the natural request, but bias the search toward current listings/spec pages.
+    return f'{n} India price specifications buy'
 
-def remember_turn(session_id: str, user_text: str, assistant_text: str) -> None:
-    history = conversation_memory.setdefault(session_id or 'local-demo', deque(maxlen=6))
-    history.append({'role': 'user', 'content': user_text})
-    if assistant_text:
-        history.append({'role': 'assistant', 'content': assistant_text})
+async def search_products(text: str) -> list[dict]:
+    query=product_search_query(text)
+    headers={'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36'}
+    params={'q':query,'kl':'in-en'}
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=headers) as c:
+            r=await c.get('https://html.duckduckgo.com/html/', params=params)
+            r.raise_for_status()
+        page=r.text
+        items=[]
+        blocks=re.findall(r'<div class="result[^>]*>(.*?)</div>\s*</div>', page, flags=re.S)
+        for block in blocks[:8]:
+            link=re.search(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, flags=re.S)
+            snippet=re.search(r'class="result__snippet"[^>]*>(.*?)</a?>', block, flags=re.S)
+            if not link: continue
+            url=html.unescape(re.sub('<.*?>','',link.group(1)))
+            title=html.unescape(re.sub('<.*?>','',link.group(2))).strip()
+            desc=html.unescape(re.sub('<.*?>','',snippet.group(1))).strip() if snippet else ''
+            if title: items.append({'title':title[:180],'url':url,'snippet':desc[:400]})
+        return items
+    except Exception:
+        return []
 
+def remember_turn(session_id,user_text,assistant_text):
+    history=conversation_memory.setdefault(session_id or 'local-demo',deque(maxlen=6)); history.append({'role':'user','content':user_text})
+    if assistant_text: history.append({'role':'assistant','content':assistant_text})
 
-def build_messages(text: str, language: str, session_id: str) -> list[dict]:
-    messages = [{'role': 'system', 'content': _system_prompt(language)}]
-    history = conversation_memory.get(session_id or 'local-demo', deque())
+def _system_prompt(language):
+    return f'''You are VOX, a precise real-time voice assistant. The input is a speech-recognition transcript and may contain small phonetic or homophone errors. Correct only obvious ASR mistakes when meaning is clear. Never invent facts. Preserve names, numbers, units, dates and model names.
+Conversation matters. Short follow-ups modify the previous request and inherit unchanged constraints. Never reject a short follow-up.
+Answer the CURRENT request directly. Never claim to have searched or accessed live data unless LIVE PRODUCT SEARCH CONTEXT is supplied below. For voice output, use short natural sentences. The user's speech language is {LANGUAGE_NAMES.get(language,language)}. Understand mixed English/Hindi naturally.'''
+
+def build_messages(text,language,session_id,product_context=''):
+    messages=[{'role':'system','content':_system_prompt(language)}]
+    history=conversation_memory.get(session_id or 'local-demo',deque())
     if history and is_follow_up(text):
         messages.extend(list(history)[-4:])
-        messages.append({
-            'role': 'system',
-            'content': (
-                'This is a follow-up to the immediately previous request. Treat it as an edit to that request. '
-                'Carry forward the previous subject and constraints unless the user explicitly changes them. '
-                'For example, if the previous request was to find laptops under ₹60,000 and the user says '
-                '“actually, make it ₹50,000”, understand that as the same laptop request with a ₹50,000 limit. '
-                'Do not reject the follow-up merely because it is short or uses “it”/“that”.'
-            ),
-        })
-    messages.append({'role': 'user', 'content': text.strip()})
+        messages.append({'role':'system','content':'This is a follow-up to the immediately previous request. Carry forward the previous subject and constraints. If the user says “actually, make it ₹50,000” after asking for laptops under ₹60,000, treat it as the same laptop search with a ₹50,000 limit.'})
+    if product_context:
+        messages.append({'role':'system','content':product_context})
+    messages.append({'role':'user','content':text.strip()})
     return messages
 
-
-async def groq_transcribe(audio: bytes, filename: str, language: str) -> str:
-    key = os.getenv('GROQ_API_KEY', '').strip()
-    if not key or key == 'your_groq_api_key_here':
-        raise RuntimeError('GROQ_API_KEY is not configured in .env')
-    model = os.getenv('GROQ_STT_MODEL', 'whisper-large-v3').strip()
-    lang = language.split('-')[0].lower() if language else 'en'
-    data = {
-        'model': model,
-        'language': lang,
-        'prompt': VOX_ASR_PROMPT,
-        'response_format': 'json',
-        'temperature': '0',
-    }
-    files = {'file': (filename or 'vox.webm', audio, 'audio/webm')}
-    headers = {'Authorization': f'Bearer {key}'}
+async def groq_transcribe(audio,filename,language):
+    key=os.getenv('GROQ_API_KEY','').strip()
+    if not key or key=='your_groq_api_key_here': raise RuntimeError('GROQ_API_KEY is not configured in .env')
+    model=os.getenv('GROQ_STT_MODEL','whisper-large-v3').strip(); lang=language.split('-')[0].lower() if language else 'en'
+    data={'model':model,'language':lang,'prompt':VOX_ASR_PROMPT,'response_format':'json','temperature':'0'}
+    files={'file':(filename or 'vox.webm',audio,'audio/webm')}
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post('https://api.groq.com/openai/v1/audio/transcriptions', data=data, files=files, headers=headers)
-        if r.status_code != 200:
-            detail = r.text[:300]
-            raise RuntimeError(f'Groq STT returned HTTP {r.status_code}: {detail}')
+        r=await c.post('https://api.groq.com/openai/v1/audio/transcriptions',data=data,files=files,headers={'Authorization':f'Bearer {key}'})
+        if r.status_code!=200: raise RuntimeError(f'Groq STT returned HTTP {r.status_code}: {r.text[:300]}')
         return (r.json().get('text') or '').strip()
 
-
-async def _installed_model(preferred: str) -> str:
-    if preferred and preferred not in {'auto', 'llama3.2:1b'}:
-        return preferred
+async def _installed_model(preferred):
+    if preferred and preferred not in {'auto','llama3.2:1b'}: return preferred
     try:
         async with httpx.AsyncClient(timeout=5) as c:
-            r = await c.get('http://127.0.0.1:11434/api/tags')
-            r.raise_for_status()
-            names = [m.get('name', '') for m in r.json().get('models', [])]
-        preferred_models = ['qwen2.5:7b', 'qwen2.5:3b', 'gemma3:4b', 'llama3.2:3b', 'llama3.1:8b', 'llama3.2:1b']
-        for candidate in preferred_models:
-            if candidate in names:
-                return candidate
+            r=await c.get('http://127.0.0.1:11434/api/tags'); r.raise_for_status(); names=[m.get('name','') for m in r.json().get('models',[])]
+        for candidate in ['qwen2.5:7b','qwen2.5:3b','gemma3:4b','llama3.2:3b','llama3.1:8b','llama3.2:1b']:
+            if candidate in names:return candidate
         return names[0] if names else 'llama3.2:1b'
-    except Exception:
-        return 'llama3.2:1b'
+    except Exception:return 'llama3.2:1b'
 
-
-async def _ollama_chat(messages: list[dict], model: str) -> str:
-    payload = {
-        'model': model,
-        'messages': messages,
-        'stream': False,
-        'options': {'temperature': 0.2, 'top_p': 0.9, 'repeat_penalty': 1.08, 'num_ctx': 4096},
-    }
+async def _ollama_chat(messages,model):
+    payload={'model':model,'messages':messages,'stream':False,'options':{'temperature':0.2,'top_p':0.9,'repeat_penalty':1.08,'num_ctx':4096}}
     async with httpx.AsyncClient(timeout=45) as c:
-        r = await c.post('http://127.0.0.1:11434/api/chat', json=payload)
-        r.raise_for_status()
-        return (r.json().get('message', {}).get('content') or '').strip()
+        r=await c.post('http://127.0.0.1:11434/api/chat',json=payload); r.raise_for_status(); return (r.json().get('message',{}).get('content') or '').strip()
 
-
-async def _groq_chat(messages: list[dict]) -> str:
-    key = os.getenv('GROQ_API_KEY', '').strip()
-    model = os.getenv('GROQ_LLM_MODEL', 'openai/gpt-oss-20b').strip()
-    if not key or key == 'your_groq_api_key_here':
-        raise RuntimeError('GROQ_API_KEY is not configured')
-    payload = {'model': model, 'messages': messages, 'temperature': 0.2, 'top_p': 0.9, 'max_completion_tokens': 500}
-    headers = {'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}
+async def _groq_chat(messages):
+    key=os.getenv('GROQ_API_KEY','').strip(); model=os.getenv('GROQ_LLM_MODEL','openai/gpt-oss-20b').strip()
+    if not key or key=='your_groq_api_key_here': raise RuntimeError('GROQ_API_KEY is not configured')
+    payload={'model':model,'messages':messages,'temperature':0.2,'top_p':0.9,'max_completion_tokens':500}
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post('https://api.groq.com/openai/v1/chat/completions', json=payload, headers=headers)
-        r.raise_for_status()
-        return (r.json().get('choices', [{}])[0].get('message', {}).get('content') or '').strip()
+        r=await c.post('https://api.groq.com/openai/v1/chat/completions',json=payload,headers={'Authorization':f'Bearer {key}','Content-Type':'application/json'}); r.raise_for_status(); return (r.json().get('choices',[{}])[0].get('message',{}).get('content') or '').strip()
 
+def _clean_voice_answer(a): return a.strip().replace('**','').replace('__','').replace('```','').strip()
+def _is_generic(a): return not ' '.join(a.lower().split()).strip(' .!?') or ' '.join(a.lower().split()).strip(' .!?') in GENERIC_RESPONSES
 
-def _clean_voice_answer(answer: str) -> str:
-    return answer.strip().replace('**', '').replace('__', '').replace('```', '').strip()
-
-
-def _is_generic(answer: str) -> bool:
-    normalized = ' '.join(answer.lower().split()).strip(' .!?')
-    return not normalized or normalized in GENERIC_RESPONSES
-
-
-def _system_prompt(language: str) -> str:
-    language_name = LANGUAGE_NAMES.get(language, language)
-    return f'''You are VOX, a precise real-time voice assistant.
-The input is a speech-recognition transcript and may contain small phonetic or homophone errors.
-Correct only an obvious ASR mistake when the intended meaning is clear. Never invent missing facts.
-Preserve proper nouns, place names, numbers, units, dates, model names, acronyms, and code terms.
-If a critical word is genuinely unclear, ask one short clarification.
-
-Conversation matters. Short follow-ups like “make it 50,000”, “change that”, “actually do 50k”,
-“use the cheaper one”, or “same thing but in Hindi” are normally modifications of the previous request.
-Resolve pronouns and omitted subjects from the recent conversation instead of rejecting the request.
-If the user changes a constraint such as price, carry every other previous constraint forward.
-
-Answer the CURRENT request directly. Never begin with a generic greeting or an offer to help.
-Do not describe hidden reasoning. Do not claim to have searched or used a tool unless one was used.
-The user's speech language is {language_name}. Understand mixed English/Hindi naturally.
-For voice output, use short natural sentences. Give the key answer first.'''
-
-
-async def ask_ollama(text: str, language: str = 'en-IN', session_id: str = 'local-demo') -> str:
-    messages = build_messages(text, language, session_id)
-    try:
-        use_groq = os.getenv('LLM_PROVIDER', 'ollama').strip().lower() == 'groq'
-        if use_groq:
-            answer = _clean_voice_answer(await _groq_chat(messages))
+async def ask_ollama(text,language='en-IN',session_id='local-demo'):
+    product_context=''
+    if is_product_request(text):
+        products=await search_products(text)
+        if products:
+            lines=['LIVE PRODUCT SEARCH CONTEXT: These are current web search results fetched for this request. Use them as evidence, but do not invent prices/specifications that are not present. Mention that listings can change.']
+            for i,p in enumerate(products,1): lines.append(f'{i}. {p["title"]} | {p["snippet"]} | {p["url"]}')
+            product_context='\n'.join(lines)
         else:
-            model = await _installed_model(os.getenv('OLLAMA_MODEL', 'auto').strip())
-            answer = _clean_voice_answer(await _ollama_chat(messages, model))
+            product_context='LIVE PRODUCT SEARCH CONTEXT: The live web search returned no usable results. Do not pretend to have product data. Say that live listings could not be retrieved and ask whether the user wants general recommendations instead.'
+    messages=build_messages(text,language,session_id,product_context)
+    try:
+        use_groq=os.getenv('LLM_PROVIDER','ollama').strip().lower()=='groq'
+        answer=_clean_voice_answer(await (_groq_chat(messages) if use_groq else _ollama_chat(messages,await _installed_model(os.getenv('OLLAMA_MODEL','auto').strip()))))
         if _is_generic(answer):
-            retry = messages + [
-                {'role': 'system', 'content': 'Retry: answer the exact current request, using conversation context for any omitted subject or changed constraint. Do not say you are ready to help.'}
-            ]
-            answer = _clean_voice_answer(await (_groq_chat(retry) if use_groq else _ollama_chat(retry, await _installed_model(os.getenv('OLLAMA_MODEL', 'auto').strip()))))
-        answer = answer or "I couldn't generate a useful answer to that request."
-        remember_turn(session_id, text.strip(), answer)
-        return answer
-    except Exception as e:
-        return f"[LLM Error: {type(e).__name__} - Check the configured {os.getenv('LLM_PROVIDER', 'ollama')} service and model.]"
+            retry=messages+[{'role':'system','content':'Retry: answer the exact request directly. If live product context is present, use it. Do not say you cannot access product data when search context is present.'}]
+            answer=_clean_voice_answer(await (_groq_chat(retry) if use_groq else _ollama_chat(retry,await _installed_model(os.getenv('OLLAMA_MODEL','auto').strip()))))
+        answer=answer or "I couldn't generate a useful answer to that request."; remember_turn(session_id,text.strip(),answer); return answer
+    except Exception as e: return f'[LLM Error: {type(e).__name__} - Check the configured {os.getenv("LLM_PROVIDER","ollama")} service and model.]'
 
-
-async def rime_tts(text: str):
-    key = os.getenv('RIME_API_KEY', '').strip()
-    endpoint = os.getenv('RIME_ENDPOINT', 'https://users.rime.ai/v1/rime-tts').strip()
-    model = os.getenv('RIME_MODEL', 'coda').strip()
-    speaker = os.getenv('RIME_SPEAKER', 'celeste').strip()
-    if not key or key == 'your_rime_api_key_here':
-        return None, None, 'RIME_API_KEY is not configured in .env'
-    headers = {'Authorization': f'Bearer {key}', 'Content-Type': 'application/json', 'Accept': 'audio/mp3'}
-    payload = {'modelId': model, 'speaker': speaker, 'text': text, 'lang': 'en'}
+async def rime_tts(text):
+    key=os.getenv('RIME_API_KEY','').strip(); endpoint=os.getenv('RIME_ENDPOINT','https://users.rime.ai/v1/rime-tts').strip(); model=os.getenv('RIME_MODEL','coda').strip(); speaker=os.getenv('RIME_SPEAKER','celeste').strip()
+    if not key or key=='your_rime_api_key_here': return None,None,'RIME_API_KEY is not configured in .env'
     try:
         async with httpx.AsyncClient(timeout=45) as c:
-            r = await c.post(endpoint, json=payload, headers=headers)
-            content_type = r.headers.get('content-type', 'audio/mp3')
-            if r.status_code != 200:
-                return None, None, f'Rime API returned HTTP {r.status_code}: {r.text[:200]}'
-            if 'audio' in content_type or 'mpeg' in content_type or 'octet-stream' in content_type:
-                return r.content, 'audio/mp3', None
+            r=await c.post(endpoint,json={'modelId':model,'speaker':speaker,'text':text,'lang':'en'},headers={'Authorization':f'Bearer {key}','Content-Type':'application/json','Accept':'audio/mp3'})
+            if r.status_code!=200:return None,None,f'Rime API returned HTTP {r.status_code}: {r.text[:200]}'
+            ct=r.headers.get('content-type','audio/mp3')
+            if 'audio' in ct or 'mpeg' in ct or 'octet-stream' in ct:return r.content,'audio/mp3',None
             try:
-                data = r.json()
-                b64 = data.get('audio') or data.get('audio_base64')
-                if b64:
-                    return base64.b64decode(b64), 'audio/mp3', None
-                return None, None, f"Rime returned unexpected JSON format: {list(data.keys())}"
-            except Exception:
-                return (r.content, 'audio/mp3', None) if r.content else (None, None, 'Empty response received from Rime API')
-    except Exception as e:
-        return None, None, f'Rime network error: {type(e).__name__} - {str(e)}'
-
+                data=r.json(); b64=data.get('audio') or data.get('audio_base64')
+                return (base64.b64decode(b64),'audio/mp3',None) if b64 else (None,None,f'Rime returned unexpected JSON format: {list(data.keys())}')
+            except Exception:return (r.content,'audio/mp3',None) if r.content else (None,None,'Empty response received from Rime API')
+    except Exception as e:return None,None,f'Rime network error: {type(e).__name__} - {str(e)}'
 
 @app.get('/health')
-async def health():
-    return {'ok': True, 'stt': os.getenv('STT_PROVIDER', 'browser'), 'llm': os.getenv('LLM_PROVIDER', 'ollama')}
-
+async def health(): return {'ok':True,'stt':os.getenv('STT_PROVIDER','groq'),'llm':os.getenv('LLM_PROVIDER','ollama'),'product_search':'duckduckgo-web'}
 
 @app.post('/transcribe')
-async def transcribe(file: UploadFile = File(...), language: str = Form('en-IN')):
-    audio = await file.read()
-    if not audio:
-        return {'text': '', 'error': 'Empty audio'}
-    try:
-        text = await groq_transcribe(audio, file.filename or 'vox.webm', language)
-        return {'text': text, 'provider': 'groq', 'model': os.getenv('GROQ_STT_MODEL', 'whisper-large-v3')}
-    except Exception as e:
-        return {'text': '', 'error': str(e), 'provider': 'groq'}
-
+async def transcribe(file: UploadFile=File(...),language: str=Form('en-IN')):
+    audio=await file.read()
+    if not audio:return {'text':'','error':'Empty audio'}
+    try:return {'text':await groq_transcribe(audio,file.filename or 'vox.webm',language),'provider':'groq','model':os.getenv('GROQ_STT_MODEL','whisper-large-v3')}
+    except Exception as e:return {'text':'','error':str(e),'provider':'groq'}
 
 @app.post('/chat')
 async def chat(req: ChatRequest):
-    text = await ask_ollama(req.text, req.language, req.session_id)
-    audio_bytes, audio_format, rime_err = await rime_tts(text)
-    return {
-        'task_id': req.task_id,
-        'text': text,
-        'audio_base64': base64.b64encode(audio_bytes).decode() if audio_bytes else None,
-        'audio_format': audio_format or 'audio/mp3',
-        'rime_error': rime_err,
-    }
+    text=await ask_ollama(req.text,req.language,req.session_id); audio_bytes,audio_format,rime_err=await rime_tts(text)
+    return {'task_id':req.task_id,'text':text,'audio_base64':base64.b64encode(audio_bytes).decode() if audio_bytes else None,'audio_format':audio_format or 'audio/mp3','rime_error':rime_err}
