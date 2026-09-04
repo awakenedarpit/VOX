@@ -19,15 +19,20 @@ uvicorn main:app --reload
 ```
 
 Serve the frontend:
+
 ```bash
 cd frontend
 python3 -m http.server 5500
 ```
+
 Open `http://127.0.0.1:5500`.
 
 Copy `.env.example` to `.env` and add real Rime configuration. Never commit `.env`.
 
 ## Verified Rime Configuration
+
+The following configuration is the configuration currently documented for the working prototype. Re-verify it against the active Rime account/configuration before submission if it changes.
+
 - Endpoint: `https://users.rime.ai/v1/rime-tts`
 - Model ID: `coda`
 - Speaker: `celeste`
@@ -35,10 +40,21 @@ Copy `.env.example` to `.env` and add real Rime configuration. Never commit `.en
 - Transport: HTTP/POST (`Accept: audio/mp3`, `Authorization: Bearer <RIME_API_KEY>`)
 
 ## Acceptance test
+
 Ask “Find laptops under ₹60,000.” Let VOX speak, then interrupt with “Actually, make it ₹50,000.” Verify old audio stops, the newer request wins, and no stale result is spoken.
 
-## Running Tests
-Run the comprehensive test suite verifying task monotonicity, interruption cutoff, and live Rime TTS:
+## Testing
+
+Deterministic tests do not require Ollama, Rime, a browser, or network access:
+
 ```bash
-./backend/.venv/bin/python -m unittest tests/test_interruption.py
+python3 -m unittest tests/test_interruption.py
 ```
+
+Live backend/Rime checks are available separately and require a running backend plus valid local Rime configuration:
+
+```bash
+VOX_LIVE_TESTS=1 python3 -m unittest tests/test_interruption.py
+```
+
+See `TESTING.md` for the manual acceptance procedure and metric definitions. Do not report measurements that have not actually been observed and recorded.
