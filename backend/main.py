@@ -81,8 +81,12 @@ Answer the CURRENT request directly. Never claim to have searched or accessed li
 def build_messages(text,language,session_id,product_context=''):
     messages=[{'role':'system','content':_system_prompt(language)}]
     history=conversation_memory.get(session_id or 'local-demo',deque())
-    if history and is_follow_up(text):
-        messages.extend(list(history)[-4:])
+    # Always provide recent conversation context, not only obvious follow-ups.
+    # This lets VOX answer references such as "what about the second one?"
+    # even when the new utterance does not contain a follow-up keyword.
+    if history:
+        messages.extend(list(history)[-6:])
+    if is_follow_up(text) and history:
         messages.append({'role':'system','content':'This is a follow-up to the immediately previous request. Carry forward the previous subject and constraints. If the user says “actually, make it ₹50,000” after asking for laptops under ₹60,000, treat it as the same laptop search with a ₹50,000 limit.'})
     if product_context: messages.append({'role':'system','content':product_context})
     messages.append({'role':'user','content':text.strip()})
@@ -125,11 +129,6 @@ def _clean_voice_answer(a): return a.strip().replace('**','').replace('__','').r
 def _is_generic(a):
     n=' '.join(a.lower().split()).strip(' .!?'); return not n or n in GENERIC_RESPONSES
 
-def _last_product_context(session_id):
-    history=conversation_memory.get(session_id or 'local-demo',deque())
-    user_turns=[x['content'] for x in history if x.get('role')=='user']
-    return next((t for t in reversed(user_turns) if any(p in t.lower() for p in PRODUCT_TERMS)), '')
-
 async def ask_ollama(text,language='en-IN',session_id='local-demo'):
     search_text=text
     if is_follow_up(text):
@@ -153,6 +152,11 @@ async def ask_ollama(text,language='en-IN',session_id='local-demo'):
             answer=_clean_voice_answer(await (_groq_chat(retry) if use_groq else _ollama_chat(retry,await _installed_model(os.getenv('OLLAMA_MODEL','auto').strip()))))
         answer=answer or "I couldn't generate a useful answer to that request."; remember_turn(session_id,text.strip(),answer); return answer
     except Exception as e: return f'[LLM Error: {type(e).__name__} - Check the configured {os.getenv("LLM_PROVIDER","ollama")} service and model.]'
+
+def _last_product_context(session_id):
+    history=conversation_memory.get(session_id or 'local-demo',deque())
+    user_turns=[x['content'] for x in history if x.get('role')=='user']
+    return next((t for t in reversed(user_turns) if any(p in t.lower() for p in PRODUCT_TERMS)), '')
 
 async def rime_tts(text):
     key=os.getenv('RIME_API_KEY','').strip(); endpoint=os.getenv('RIME_ENDPOINT','https://users.rime.ai/v1/rime-tts').strip(); model=os.getenv('RIME_MODEL','coda').strip(); speaker=os.getenv('RIME_SPEAKER','celeste').strip()
@@ -184,9 +188,6 @@ async def chat(req: ChatRequest):
     text=await ask_ollama(req.text,req.language,req.session_id); audio_bytes,audio_format,rime_err=await rime_tts(text)
     return {'task_id':req.task_id,'text':text,'audio_base64':base64.b64encode(audio_bytes).decode() if audio_bytes else None,'audio_format':audio_format or 'audio/mp3','rime_error':rime_err}
 
-# Serve the VOX frontend from the same FastAPI origin. This removes the
-# separate 5500 -> 8000 browser-routing problem in Codespaces while keeping
-# /health, /transcribe and /chat above the static mount.
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / 'frontend'
 if FRONTEND_DIR.exists():
     app.mount('/', StaticFiles(directory=FRONTEND_DIR, html=True), name='frontend')
