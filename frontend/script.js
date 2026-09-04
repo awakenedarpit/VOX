@@ -51,9 +51,7 @@ function updateEvaluationSummary() {
   const completed = interruptionTrials.filter(t => t.recovery_success !== null);
   const successes = completed.filter(t => t.recovery_success).length;
   const stale = completed.reduce((n, t) => n + t.stale_results, 0);
-  const recoveryTimes = completed
-    .map(t => t.recovery_time_ms)
-    .filter(v => Number.isFinite(v));
+  const recoveryTimes = completed.map(t => t.recovery_time_ms).filter(v => Number.isFinite(v));
   const avgRecovery = recoveryTimes.length
     ? Math.round(recoveryTimes.reduce((a, b) => a + b, 0) / recoveryTimes.length)
     : null;
@@ -81,7 +79,6 @@ function exportEvaluation() {
   URL.revokeObjectURL(url);
 }
 
-// UI State Updater
 function setState(state, hintText) {
   currentState = state;
   stateEl.textContent = state;
@@ -92,11 +89,9 @@ function setState(state, hintText) {
   if (state === 'LISTENING') {
     micBtn.classList.add('active');
     micBtn.textContent = '⏹️ Stop Listening';
-  } else if (state === 'IDLE') {
-    if (!isMicActive) {
-      micBtn.classList.remove('active');
-      micBtn.textContent = '🎤 Start Listening';
-    }
+  } else if (state === 'IDLE' && !isMicActive) {
+    micBtn.classList.remove('active');
+    micBtn.textContent = '🎤 Start Listening';
   }
   recordEvent('state_changed', { new_state: state });
 }
@@ -112,9 +107,7 @@ function addMessage(sender, text, taskId, isInterrupted = false) {
 
   const body = document.createElement('div');
   body.textContent = text;
-  if (isInterrupted) {
-    body.innerHTML += ' <em style="color:#ff557f;font-size:12px;">(Interrupted)</em>';
-  }
+  if (isInterrupted) body.innerHTML += ' <em style="color:#ff557f;font-size:12px;">(Interrupted)</em>';
 
   msg.appendChild(header);
   msg.appendChild(body);
@@ -193,9 +186,12 @@ function interrupt(reason = 'Interruption') {
 
 async function sendQuery(text) {
   clearError();
-  const taskId = ++currentTaskId;
+  // An interruption reserves the next task ID. Reuse it so the recovery trial
+  // measures the actual superseding request rather than creating a third task.
+  const isRecoveryTask = pendingRecovery && pendingRecovery.new_task_id === currentTaskId && pendingRecovery.recovery_success === null;
+  const taskId = isRecoveryTask ? currentTaskId : ++currentTaskId;
   taskMetric.textContent = `#${taskId}`;
-  recordEvent('task_created', { task_id_created: taskId, text_length: text.length });
+  recordEvent('task_created', { task_id_created: taskId, text_length: text.length, recovery_task: isRecoveryTask });
   addMessage('user', text, taskId);
   setState('THINKING', 'VOX is thinking...');
 
@@ -225,7 +221,6 @@ async function sendQuery(text) {
     }
 
     addMessage('vox', data.text, taskId);
-
     if (data.audio_base64) {
       playRimeAudio(data.audio_base64, data.audio_format, taskId);
     } else {
@@ -244,7 +239,7 @@ async function sendQuery(text) {
 }
 
 function markRecoveryPlaybackStarted(taskId) {
-  if (!pendingRecovery || pendingRecovery.new_task_id !== taskId) return;
+  if (!pendingRecovery || pendingRecovery.new_task_id !== taskId || pendingRecovery.recovery_success !== null) return;
   pendingRecovery.recovery_time_ms = Number((performance.now() - pendingRecovery.interruption_detected_at).toFixed(3));
   pendingRecovery.recovery_success = true;
   recordEvent('new_audio_playback_started', { recovery_time_ms: pendingRecovery.recovery_time_ms });
@@ -422,8 +417,10 @@ clearBtn.addEventListener('click', () => {
 
 evalBtn?.addEventListener('click', () => {
   const current = interruptionTrials.find(t => t.new_task_id === currentTaskId && t.recovery_success === null);
-  if (current) current.recovery_success = false;
-  recordEvent('evaluation_snapshot', { completed_trials: interruptionTrials.length });
+  if (current) {
+    current.recovery_success = false;
+    recordEvent('evaluation_trial_marked_failed', { trial_id: current.trial_id });
+  }
   updateEvaluationSummary();
 });
 
