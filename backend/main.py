@@ -1,6 +1,7 @@
 import os, base64, re, html
 from pathlib import Path
 from collections import deque
+from urllib.parse import unquote
 
 # pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
@@ -30,7 +31,6 @@ LANGUAGE_NAMES = {'en-IN':'English (India)','en-US':'English (US)','hi-IN':'Hind
 VOX_ASR_PROMPT = ('VOX technical vocabulary and spelling context: VS Code, Visual Studio Code, Git, GitHub, GitHub Actions, API, REST API, Python, JavaScript, TypeScript, React, FastAPI, HTML, CSS, Ollama, Rime, LiveKit, Whisper, Groq, laptop, tablet, Indore, Ujjain. Preserve technical names, acronyms, numbers, currency, model names, and code terms.')
 conversation_memory: dict[str, deque] = {}
 FOLLOW_UP_MARKERS = ('actually','instead','make it','change it','change that','update it','keep everything else','same thing','same one','under ','below ','increase it','decrease it','raise it','lower it','remove that','add that','add it','only change','change the budget','change the price')
-
 PRODUCT_TERMS = ('laptop','notebook','macbook','chromebook','tablet','phone','smartphone','monitor','headphones','earbuds','keyboard','mouse','camera','tv','television','watch','smartwatch')
 SHOPPING_TERMS = ('find','search','recommend','best','buy','price','cost','under','below','budget','cheapest','available','deal','deals','for sale')
 
@@ -41,29 +41,29 @@ def is_product_request(text):
     n=text.lower(); return any(t in n for t in PRODUCT_TERMS) and any(t in n for t in SHOPPING_TERMS)
 
 def product_search_query(text):
-    n=' '.join(text.split())
-    # Keep the natural request, but bias the search toward current listings/spec pages.
-    return f'{n} India price specifications buy'
+    return f'{" ".join(text.split())} India price specifications buy'
 
 async def search_products(text: str) -> list[dict]:
     query=product_search_query(text)
     headers={'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36'}
-    params={'q':query,'kl':'in-en'}
     try:
         async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=headers) as c:
-            r=await c.get('https://html.duckduckgo.com/html/', params=params)
+            r=await c.get('https://html.duckduckgo.com/html/', params={'q':query,'kl':'in-en'})
             r.raise_for_status()
         page=r.text
         items=[]
-        blocks=re.findall(r'<div class="result[^>]*>(.*?)</div>\s*</div>', page, flags=re.S)
-        for block in blocks[:8]:
-            link=re.search(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, flags=re.S)
-            snippet=re.search(r'class="result__snippet"[^>]*>(.*?)</a?>', block, flags=re.S)
-            if not link: continue
-            url=html.unescape(re.sub('<.*?>','',link.group(1)))
-            title=html.unescape(re.sub('<.*?>','',link.group(2))).strip()
-            desc=html.unescape(re.sub('<.*?>','',snippet.group(1))).strip() if snippet else ''
-            if title: items.append({'title':title[:180],'url':url,'snippet':desc[:400]})
+        # DDG result markup is intentionally parsed defensively; this is a best-effort public-web lookup.
+        for match in re.finditer(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', page, re.S|re.I):
+            raw_url=html.unescape(match.group(1)); title=html.unescape(re.sub(r'<[^>]+>','',match.group(2))).strip()
+            raw_url=unquote(raw_url)
+            if 'uddg=' in raw_url:
+                target=re.search(r'[?&]uddg=([^&]+)',raw_url)
+                if target: raw_url=unquote(target.group(1))
+            start=match.end(); tail=page[start:start+1800]
+            sm=re.search(r'class="result__snippet"[^>]*>(.*?)</',tail,re.S|re.I)
+            snippet=html.unescape(re.sub(r'<[^>]+>','',sm.group(1))).strip() if sm else ''
+            if title and raw_url.startswith('http'): items.append({'title':title[:180],'url':raw_url,'snippet':snippet[:500]})
+            if len(items)>=8: break
         return items
     except Exception:
         return []
@@ -83,8 +83,7 @@ def build_messages(text,language,session_id,product_context=''):
     if history and is_follow_up(text):
         messages.extend(list(history)[-4:])
         messages.append({'role':'system','content':'This is a follow-up to the immediately previous request. Carry forward the previous subject and constraints. If the user says “actually, make it ₹50,000” after asking for laptops under ₹60,000, treat it as the same laptop search with a ₹50,000 limit.'})
-    if product_context:
-        messages.append({'role':'system','content':product_context})
+    if product_context: messages.append({'role':'system','content':product_context})
     messages.append({'role':'user','content':text.strip()})
     return messages
 
@@ -122,24 +121,34 @@ async def _groq_chat(messages):
         r=await c.post('https://api.groq.com/openai/v1/chat/completions',json=payload,headers={'Authorization':f'Bearer {key}','Content-Type':'application/json'}); r.raise_for_status(); return (r.json().get('choices',[{}])[0].get('message',{}).get('content') or '').strip()
 
 def _clean_voice_answer(a): return a.strip().replace('**','').replace('__','').replace('```','').strip()
-def _is_generic(a): return not ' '.join(a.lower().split()).strip(' .!?') or ' '.join(a.lower().split()).strip(' .!?') in GENERIC_RESPONSES
+def _is_generic(a):
+    n=' '.join(a.lower().split()).strip(' .!?'); return not n or n in GENERIC_RESPONSES
+
+def _last_product_context(session_id):
+    history=conversation_memory.get(session_id or 'local-demo',deque())
+    user_turns=[x['content'] for x in history if x.get('role')=='user']
+    return next((t for t in reversed(user_turns) if any(p in t.lower() for p in PRODUCT_TERMS)), '')
 
 async def ask_ollama(text,language='en-IN',session_id='local-demo'):
+    search_text=text
+    if is_follow_up(text):
+        previous=_last_product_context(session_id)
+        if previous: search_text=f'{previous}; follow-up constraint: {text}'
     product_context=''
-    if is_product_request(text):
-        products=await search_products(text)
+    if is_product_request(search_text):
+        products=await search_products(search_text)
         if products:
-            lines=['LIVE PRODUCT SEARCH CONTEXT: These are current web search results fetched for this request. Use them as evidence, but do not invent prices/specifications that are not present. Mention that listings can change.']
+            lines=['LIVE PRODUCT SEARCH CONTEXT: Current public-web results fetched for this request. Use only facts present in these results. Do not invent prices/specifications. Listings can change.']
             for i,p in enumerate(products,1): lines.append(f'{i}. {p["title"]} | {p["snippet"]} | {p["url"]}')
             product_context='\n'.join(lines)
         else:
-            product_context='LIVE PRODUCT SEARCH CONTEXT: The live web search returned no usable results. Do not pretend to have product data. Say that live listings could not be retrieved and ask whether the user wants general recommendations instead.'
+            product_context='LIVE PRODUCT SEARCH CONTEXT: No usable public-web results were retrieved. Do not claim to have product listings. Say live listings could not be retrieved.'
     messages=build_messages(text,language,session_id,product_context)
     try:
         use_groq=os.getenv('LLM_PROVIDER','ollama').strip().lower()=='groq'
         answer=_clean_voice_answer(await (_groq_chat(messages) if use_groq else _ollama_chat(messages,await _installed_model(os.getenv('OLLAMA_MODEL','auto').strip()))))
         if _is_generic(answer):
-            retry=messages+[{'role':'system','content':'Retry: answer the exact request directly. If live product context is present, use it. Do not say you cannot access product data when search context is present.'}]
+            retry=messages+[{'role':'system','content':'Retry: answer the exact request directly. If LIVE PRODUCT SEARCH CONTEXT is present, use it and do not say you cannot access product data.'}]
             answer=_clean_voice_answer(await (_groq_chat(retry) if use_groq else _ollama_chat(retry,await _installed_model(os.getenv('OLLAMA_MODEL','auto').strip()))))
         answer=answer or "I couldn't generate a useful answer to that request."; remember_turn(session_id,text.strip(),answer); return answer
     except Exception as e: return f'[LLM Error: {type(e).__name__} - Check the configured {os.getenv("LLM_PROVIDER","ollama")} service and model.]'
