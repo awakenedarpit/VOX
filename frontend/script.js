@@ -10,7 +10,10 @@ const textForm = $('text-form'), textInput = $('text-input'), clearBtn = $('clea
 const evalBtn = $('eval-btn'), exportBtn = $('export-eval-btn'), evalSummaryEl = $('eval-summary');
 const languageSelect = $('speech-language');
 
-const API_BASE = 'http://127.0.0.1:8000';
+// In local Chrome this becomes http://127.0.0.1:8000.
+// In a remote workspace/preview, use the same hostname as the frontend so
+// 127.0.0.1 does not incorrectly point at the browser's own machine.
+const API_BASE = window.VOX_API_BASE || `${window.location.protocol}//${window.location.hostname}:8000`;
 let currentTaskId = 0;
 let currentState = 'IDLE';
 let isMicActive = false;
@@ -46,7 +49,7 @@ function updateEvaluationSummary() {
 }
 
 function exportEvaluation() {
-  const blob = new Blob([JSON.stringify({ exported_at: new Date().toISOString(), stt: 'Browser SpeechRecognition', trials: interruptionTrials, events: evaluationEvents }, null, 2)], { type: 'application/json' });
+  const blob = new Blob([JSON.stringify({ exported_at: new Date().toISOString(), api_base: API_BASE, stt: 'Browser SpeechRecognition', trials: interruptionTrials, events: evaluationEvents }, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = `vox-evaluation-${Date.now()}.json`;
@@ -143,7 +146,7 @@ async function sendQuery(text) {
   if (taskMetric) taskMetric.textContent = `#${taskId}`;
   bargeInTask = null;
   activeResponseText = '';
-  recordEvent('task_created', { task_id_created: taskId, input_source: 'browser-speech-recognition', speech_language: language(), recovery_task: recovery });
+  recordEvent('task_created', { task_id_created: taskId, input_source: 'browser-speech-recognition', speech_language: language(), recovery_task: recovery, api_base: API_BASE });
   addMessage('user', cleaned, taskId);
   setState('THINKING', 'VOX is thinking…');
   if (currentAbortController) currentAbortController.abort();
@@ -169,7 +172,13 @@ async function sendQuery(text) {
     else speakFallback(activeResponseText, taskId);
   } catch (err) {
     if (err.name === 'AbortError') recordEvent('request_aborted', { aborted_task_id: taskId });
-    else if (taskId === currentTaskId) { showError(`Error: ${err.message}`); setState(isMicActive ? 'LISTENING' : 'IDLE', 'Could not reach the VOX backend.'); }
+    else if (taskId === currentTaskId) {
+      const detail = err instanceof TypeError && err.message === 'Failed to fetch'
+        ? `Cannot connect to VOX backend at ${API_BASE}. Start FastAPI on port 8000 and keep it running.`
+        : `Error: ${err.message}`;
+      showError(detail);
+      setState(isMicActive ? 'LISTENING' : 'IDLE', 'Backend connection failed.');
+    }
   }
 }
 
@@ -260,34 +269,32 @@ async function toggleMic() {
   if (!recognition && !setupSpeechRecognition()) return;
   if (isMicActive) {
     isMicActive = false;
-    clearTimeout(restartTimer); clearTimeout(finalTimer); finalBuffer = '';
-    try { recognition.stop(); } catch (_) {}
+    clearTimeout(restartTimer);
+    recognition?.abort();
     recognitionRunning = false;
-    setState('IDLE', 'Ready.');
+    setState('IDLE', 'Listening stopped.');
     return;
   }
   isMicActive = true;
   recognition.lang = language();
-  try { recognition.start(); setState('LISTENING', 'Listening… speak naturally.'); }
-  catch (err) { isMicActive = false; showError(`Could not start microphone: ${err.message}`); setState('IDLE', 'Try again.'); }
+  try {
+    recognition.start();
+    setState('LISTENING', 'Listening… speak naturally.');
+  } catch (err) {
+    isMicActive = false;
+    showError(`Could not start speech recognition: ${err.message}`);
+    setState('IDLE', 'Ready.');
+  }
 }
 
-function stopCurrent() {
-  if (currentState === 'SPEAKING' || currentState === 'THINKING') beginInterruption('Manual stop');
-}
+if (micBtn) micBtn.addEventListener('click', toggleMic);
+if (stopBtn) stopBtn.addEventListener('click', () => interrupt('Manual interruption'));
+if (clearBtn) clearBtn.addEventListener('click', () => { transcriptEl.innerHTML = ''; });
+if (exportBtn) exportBtn.addEventListener('click', exportEvaluation);
+if (evalBtn) evalBtn.addEventListener('click', () => { updateEvaluationSummary(); });
+if (simBtn1) simBtn1.addEventListener('click', () => { if (currentState === 'SPEAKING' || currentState === 'THINKING') interrupt('Simulation: budget changed'); sendQuery('Find laptops under 50000 rupees.'); });
+if (simBtn2) simBtn2.addEventListener('click', () => { if (currentState === 'SPEAKING' || currentState === 'THINKING') interrupt('Simulation: user changed requirement'); sendQuery('Actually, make the budget 50000 rupees and keep everything else the same.'); });
+if (textForm) textForm.addEventListener('submit', (e) => { e.preventDefault(); const text = textInput.value.trim(); if (text) { textInput.value = ''; sendQuery(text); } });
+if (languageSelect) languageSelect.addEventListener('change', () => { if (recognition) recognition.lang = language(); });
 
-micBtn?.addEventListener('click', toggleMic);
-stopBtn?.addEventListener('click', () => stopCurrent());
-clearBtn?.addEventListener('click', () => { transcriptEl.innerHTML = ''; clearError(); });
-evalBtn?.addEventListener('click', () => { const open = interruptionTrials.find(t => t.recovery_success === null); if (open) { open.recovery_success = false; open.recovery_time_ms = null; updateEvaluationSummary(); } });
-exportBtn?.addEventListener('click', exportEvaluation);
-textForm?.addEventListener('submit', e => { e.preventDefault(); const text = textInput.value.trim(); textInput.value = ''; sendQuery(text); });
-simBtn1?.addEventListener('click', () => sendQuery('Find laptops under sixty thousand rupees.'));
-simBtn2?.addEventListener('click', () => { if (currentState === 'SPEAKING' || currentState === 'THINKING') beginInterruption('Simulation interruption'); setTimeout(() => sendQuery('Actually, make it fifty thousand rupees.'), 50); });
-languageSelect?.addEventListener('change', () => { if (recognition) recognition.lang = language(); recordEvent('speech_language_changed', { language: language() }); });
-
-window.interrupt = interrupt;
-window.sendQuery = sendQuery;
-window.toggleMic = toggleMic;
-recordEvent('vox_ready', { speech_input: 'browser-speech-recognition' });
-setState('IDLE', 'Ready. Click Start Listening and speak naturally.');
+setState('IDLE', 'Ready. Click Start Listening to talk to VOX.');
