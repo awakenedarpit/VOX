@@ -222,7 +222,9 @@ async def rime_tts(text):
     except Exception as e:return None,None,f'Rime network error: {type(e).__name__} - {str(e)}'
 
 @app.get('/health')
-async def health(): return {'ok':True,'stt':os.getenv('STT_PROVIDER','groq'),'llm':_configured_provider(),'product_search':'duckduckgo-web','memory_messages':HISTORY_MESSAGES,'memory_turns':HISTORY_MESSAGES // 2}
+async def health():
+    rime_key=os.getenv('RIME_API_KEY','').strip()
+    return {'ok':True,'stt':os.getenv('STT_PROVIDER','groq'),'llm':_configured_provider(),'rime_configured':bool(rime_key and rime_key != 'your_rime_api_key_here'),'product_search':'duckduckgo-web','memory_messages':HISTORY_MESSAGES,'memory_turns':HISTORY_MESSAGES // 2}
 
 @app.get('/memory')
 async def memory_status(session_id: str = 'local-demo'):
