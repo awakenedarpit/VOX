@@ -15,20 +15,9 @@ const languageSelect = $('speech-language');
 // e.g. ...-5500.app.github.dev -> ...-8000.app.github.dev.
 function resolveApiBase() {
   if (window.VOX_API_BASE) return window.VOX_API_BASE.replace(/\/$/, '');
-
   const host = window.location.hostname;
-
-  // When VOX is served directly by FastAPI, use the current origin.
-  // This is required for GitHub Codespaces forwarded ports.
-  if (host.endsWith('.app.github.dev')) {
-    return window.location.origin;
-  }
-
-  // Local development on port 8000.
-  if (host === 'localhost' || host === '127.0.0.1' || host === '[::1]') {
-    return `${window.location.protocol}//${host}:8000`;
-  }
-
+  if (host.endsWith('.app.github.dev')) return window.location.origin;
+  if (host === 'localhost' || host === '127.0.0.1' || host === '[::1]') return `${window.location.protocol}//${host}:8000`;
   return window.location.origin;
 }
 const API_BASE = resolveApiBase();
@@ -69,10 +58,7 @@ function updateEvaluationSummary() {
 
 function exportEvaluation() {
   const blob = new Blob([JSON.stringify({ exported_at: new Date().toISOString(), api_base: API_BASE, stt: 'Browser SpeechRecognition', trials: interruptionTrials, events: evaluationEvents }, null, 2)], { type: 'application/json' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `vox-evaluation-${Date.now()}.json`;
-  a.click();
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `vox-evaluation-${Date.now()}.json`; a.click();
 }
 
 function setState(state, hint = '') {
@@ -81,10 +67,7 @@ function setState(state, hint = '') {
   if (hintEl) hintEl.textContent = hint;
   if (orb) orb.className = 'orb ' + state.toLowerCase();
   if (stopBtn) stopBtn.hidden = state !== 'SPEAKING' && state !== 'THINKING';
-  if (micBtn) {
-    micBtn.classList.toggle('active', isMicActive);
-    micBtn.textContent = isMicActive ? '⏹️ Stop Listening' : '🎤 Start Listening';
-  }
+  if (micBtn) { micBtn.classList.toggle('active', isMicActive); micBtn.textContent = isMicActive ? '⏹️ Stop Listening' : '🎤 Start Listening'; }
   recordEvent('state_changed', { new_state: state });
 }
 
@@ -92,17 +75,11 @@ function showError(message) { if (errEl) { errEl.hidden = false; errEl.textConte
 function clearError() { if (errEl) { errEl.hidden = true; errEl.textContent = ''; } }
 
 function addMessage(sender, text, taskId, interrupted = false) {
-  const msg = document.createElement('div');
-  msg.className = `msg ${sender}` + (interrupted ? ' interrupted-tag' : '');
-  const header = document.createElement('div');
-  header.className = 'msg-header';
-  header.innerHTML = `<span>${sender === 'user' ? 'YOU' : 'VOX'}</span><span>Task #${taskId}</span>`;
-  const body = document.createElement('div');
-  body.textContent = text;
+  const msg = document.createElement('div'); msg.className = `msg ${sender}` + (interrupted ? ' interrupted-tag' : '');
+  const header = document.createElement('div'); header.className = 'msg-header'; header.innerHTML = `<span>${sender === 'user' ? 'YOU' : 'VOX'}</span><span>Task #${taskId}</span>`;
+  const body = document.createElement('div'); body.textContent = text;
   if (interrupted) { const tag = document.createElement('em'); tag.textContent = ' (Interrupted)'; body.appendChild(tag); }
-  msg.append(header, body);
-  transcriptEl.appendChild(msg);
-  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  msg.append(header, body); transcriptEl.appendChild(msg); transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
 function normalize(text) { return text.toLowerCase().replace(/[^a-z0-9₹]+/g, ' ').trim(); }
@@ -122,186 +99,105 @@ function acceptable(text) {
 function language() { return languageSelect?.value || 'en-IN'; }
 
 function stopAudio() {
-  const t = performance.now();
-  let stopped = false;
-  if (activeAudio) {
-    activeAudio.onended = null; activeAudio.onerror = null; activeAudio.pause();
-    try { activeAudio.currentTime = 0; } catch (_) {}
-    activeAudio.removeAttribute('src'); activeAudio.load(); activeAudio = null; stopped = true;
-  }
+  const t = performance.now(); let stopped = false;
+  if (activeAudio) { activeAudio.onended = null; activeAudio.onerror = null; activeAudio.pause(); try { activeAudio.currentTime = 0; } catch (_) {} activeAudio.removeAttribute('src'); activeAudio.load(); activeAudio = null; stopped = true; }
   if (window.speechSynthesis?.speaking || window.speechSynthesis?.pending) { window.speechSynthesis.cancel(); stopped = true; }
   if (currentAbortController) { currentAbortController.abort(); currentAbortController = null; }
-  recordEvent('audio_stop_requested');
-  if (stopped) recordEvent('audio_stopped', { stop_duration_ms: Number((performance.now() - t).toFixed(2)) });
+  recordEvent('audio_stop_requested'); if (stopped) recordEvent('audio_stopped', { stop_duration_ms: Number((performance.now() - t).toFixed(2)) });
   return Number((performance.now() - t).toFixed(2));
 }
 
 function beginInterruption(reason = 'Voice barge-in detected') {
   if (currentState !== 'SPEAKING' && currentState !== 'THINKING') return null;
-  const detected = performance.now();
-  const oldTask = currentTaskId;
-  const cutoff = stopAudio();
-  currentTaskId += 1;
-  activeResponseText = '';
-  bargeInTask = currentTaskId;
-  ignoreRecognitionUntil = performance.now() + 250;
+  const detected = performance.now(), oldTask = currentTaskId, cutoff = stopAudio();
+  currentTaskId += 1; activeResponseText = ''; bargeInTask = currentTaskId; ignoreRecognitionUntil = performance.now() + 250;
   pendingRecovery = { trial_id: interruptionTrials.length + 1, interrupted_task_id: oldTask, new_task_id: currentTaskId, interruption_detected_at: detected, cutoff_latency_ms: cutoff, recovery_time_ms: null, stale_results: 0, recovery_success: null, reason };
-  interruptionTrials.push(pendingRecovery);
-  if (taskMetric) taskMetric.textContent = `#${currentTaskId}`;
-  recordEvent('interruption_detected', { reason, interrupted_task_id: oldTask });
-  recordEvent('task_invalidated', { invalidated_task_id: oldTask });
-  setState('INTERRUPTED', 'Previous response stopped. Listening for your new instruction…');
-  return currentTaskId;
+  interruptionTrials.push(pendingRecovery); if (taskMetric) taskMetric.textContent = `#${currentTaskId}`;
+  recordEvent('interruption_detected', { reason, interrupted_task_id: oldTask }); recordEvent('task_invalidated', { invalidated_task_id: oldTask });
+  setState('INTERRUPTED', 'Previous response stopped. Listening for your new instruction…'); return currentTaskId;
 }
 function interrupt(reason = 'Manual interruption') { return beginInterruption(reason); }
 
 async function sendQuery(text) {
-  const cleaned = text.trim().replace(/\s+/g, ' ');
-  if (!acceptable(cleaned)) return;
-  lastSubmittedTranscript = cleaned;
-  clearError();
+  const cleaned = text.trim().replace(/\s+/g, ' '); if (!acceptable(cleaned)) return;
+  lastSubmittedTranscript = cleaned; clearError();
   const recovery = pendingRecovery && pendingRecovery.new_task_id === currentTaskId && pendingRecovery.recovery_success === null;
   const taskId = recovery ? currentTaskId : ++currentTaskId;
-  if (taskMetric) taskMetric.textContent = `#${taskId}`;
-  bargeInTask = null;
-  activeResponseText = '';
+  if (taskMetric) taskMetric.textContent = `#${taskId}`; bargeInTask = null; activeResponseText = '';
   recordEvent('task_created', { task_id_created: taskId, input_source: 'browser-speech-recognition', speech_language: language(), recovery_task: recovery, api_base: API_BASE });
-  addMessage('user', cleaned, taskId);
-  setState('THINKING', 'VOX is thinking…');
-  if (currentAbortController) currentAbortController.abort();
-  currentAbortController = new AbortController();
+  addMessage('user', cleaned, taskId); setState('THINKING', 'VOX is thinking…');
+  if (currentAbortController) currentAbortController.abort(); currentAbortController = new AbortController();
   try {
     recordEvent('llm_started');
-    const res = await fetch(`${API_BASE}/chat`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: cleaned, task_id: taskId, language: language() }), signal: currentAbortController.signal,
-    });
+    const res = await fetch(`${API_BASE}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: cleaned, task_id: taskId, language: language() }), signal: currentAbortController.signal });
     if (!res.ok) throw new Error(`Server returned ${res.status}: ${await res.text()}`);
-    const data = await res.json();
-    recordEvent('llm_completed', { response_task_id: data.task_id });
-    if (taskId !== currentTaskId) {
-      recordEvent('stale_result_discarded', { stale_task_id: taskId, active_task_id: currentTaskId });
-      const trial = interruptionTrials.find(t => t.new_task_id === currentTaskId && t.recovery_success === null);
-      if (trial) trial.stale_results += 1;
-      return;
-    }
-    activeResponseText = data.text || '';
-    addMessage('vox', activeResponseText, taskId);
-    if (data.audio_base64) playRimeAudio(data.audio_base64, data.audio_format, taskId);
-    else speakFallback(activeResponseText, taskId);
+    const data = await res.json(); recordEvent('llm_completed', { response_task_id: data.task_id });
+    if (taskId !== currentTaskId) { recordEvent('stale_result_discarded', { stale_task_id: taskId, active_task_id: currentTaskId }); const trial = interruptionTrials.find(t => t.new_task_id === currentTaskId && t.recovery_success === null); if (trial) trial.stale_results += 1; return; }
+    activeResponseText = data.text || ''; addMessage('vox', activeResponseText, taskId);
+    if (data.audio_base64) playRimeAudio(data.audio_base64, data.audio_format, taskId); else speakFallback(activeResponseText, taskId);
   } catch (err) {
     if (err.name === 'AbortError') recordEvent('request_aborted', { aborted_task_id: taskId });
-    else if (taskId === currentTaskId) {
-      const detail = err instanceof TypeError && err.message === 'Failed to fetch'
-        ? `Cannot connect to VOX backend at ${API_BASE}. Make sure port 8000 is running and forwarded.`
-        : `Error: ${err.message}`;
-      showError(detail);
-      setState(isMicActive ? 'LISTENING' : 'IDLE', 'Backend connection failed.');
-    }
+    else if (taskId === currentTaskId) { const detail = err instanceof TypeError && err.message === 'Failed to fetch' ? `Cannot connect to VOX backend at ${API_BASE}. Make sure port 8000 is running and forwarded.` : `Error: ${err.message}`; showError(detail); setState(isMicActive ? 'LISTENING' : 'IDLE', 'Backend connection failed.'); }
   }
 }
 
 function markRecovery(taskId) {
   if (!pendingRecovery || pendingRecovery.new_task_id !== taskId || pendingRecovery.recovery_success !== null) return;
-  pendingRecovery.recovery_time_ms = Number((performance.now() - pendingRecovery.interruption_detected_at).toFixed(2));
-  pendingRecovery.recovery_success = true;
-  if (latencyMetric) latencyMetric.textContent = `${Math.round(pendingRecovery.recovery_time_ms)} ms`;
-  recordEvent('new_audio_playback_started', { recovery_time_ms: pendingRecovery.recovery_time_ms });
+  pendingRecovery.recovery_time_ms = Number((performance.now() - pendingRecovery.interruption_detected_at).toFixed(2)); pendingRecovery.recovery_success = true;
+  if (latencyMetric) latencyMetric.textContent = `${Math.round(pendingRecovery.recovery_time_ms)} ms`; recordEvent('new_audio_playback_started', { recovery_time_ms: pendingRecovery.recovery_time_ms });
 }
 
 function playRimeAudio(base64, format, taskId) {
-  stopAudio();
-  const audio = new Audio(`data:${format || 'audio/mp3'};base64,${base64}`);
-  activeAudio = audio;
-  setState('SPEAKING', 'VOX is speaking with official Rime voice. Interrupt anytime.');
-  recordEvent('rime_audio_received', { audio_format: format || 'audio/mp3' });
+  stopAudio(); const audio = new Audio(`data:${format || 'audio/mp3'};base64,${base64}`); activeAudio = audio;
+  setState('SPEAKING', 'VOX is speaking with official Rime voice. Interrupt anytime.'); recordEvent('rime_audio_received', { audio_format: format || 'audio/mp3' });
   audio.onended = () => { if (taskId !== currentTaskId) return; activeAudio = null; recordEvent('task_completed', { completed_task_id: taskId }); setState(isMicActive ? 'LISTENING' : 'IDLE', isMicActive ? 'Listening…' : 'Ready.'); };
   audio.onerror = () => { if (taskId !== currentTaskId) return; activeAudio = null; showError('Rime audio could not be played.'); setState(isMicActive ? 'LISTENING' : 'IDLE', 'Ready.'); };
   audio.play().then(() => { if (taskId === currentTaskId && activeAudio === audio) { recordEvent('audio_playback_started', { playback_task_id: taskId, provider: 'rime' }); markRecovery(taskId); } }).catch(err => showError(`Audio playback error: ${err.message}`));
 }
 
+// Browser fallback: explicitly prefer an English voice instead of the browser's
+// default voice. This prevents en-IN text from being spoken with a Hindi voice.
 function speakFallback(text, taskId) {
   if (!('speechSynthesis' in window)) { setState(isMicActive ? 'LISTENING' : 'IDLE', 'Rime audio unavailable.'); return; }
   stopAudio();
-  const u = new SpeechSynthesisUtterance(text); u.rate = 1.02;
+  const u = new SpeechSynthesisUtterance(text); u.rate = 1.02; u.lang = language();
+  const voices = window.speechSynthesis.getVoices();
+  const target = language();
+  const englishVoice = voices.find(v => v.lang === target)
+    || voices.find(v => v.lang?.toLowerCase() === target.toLowerCase())
+    || voices.find(v => v.lang?.toLowerCase().startsWith('en-in'))
+    || voices.find(v => v.lang?.toLowerCase().startsWith('en-us'))
+    || voices.find(v => v.lang?.toLowerCase().startsWith('en'));
+  if (englishVoice) { u.voice = englishVoice; u.lang = englishVoice.lang; recordEvent('fallback_voice_selected', { voice_name: englishVoice.name, voice_lang: englishVoice.lang }); }
+  else { recordEvent('fallback_voice_selected', { voice_name: 'browser-default', voice_lang: u.lang }); }
   u.onstart = () => { if (taskId === currentTaskId) { setState('SPEAKING', 'VOX is speaking. Interrupt anytime.'); recordEvent('audio_playback_started', { provider: 'browser-fallback', playback_task_id: taskId }); markRecovery(taskId); } };
   u.onend = () => { if (taskId === currentTaskId) { recordEvent('task_completed', { completed_task_id: taskId }); setState(isMicActive ? 'LISTENING' : 'IDLE', isMicActive ? 'Listening…' : 'Ready.'); } };
   window.speechSynthesis.speak(u);
 }
 
-function flushFinal() {
-  clearTimeout(finalTimer);
-  const text = finalBuffer.trim();
-  finalBuffer = '';
-  if (text && acceptable(text)) sendQuery(text);
-}
-
-function restartRecognition() {
-  if (!isMicActive || !recognition || recognitionRunning) return;
-  clearTimeout(restartTimer);
-  restartTimer = setTimeout(() => { if (isMicActive && !recognitionRunning) { try { recognition.lang = language(); recognition.start(); } catch (_) {} } }, 200);
-}
+function flushFinal() { clearTimeout(finalTimer); const text = finalBuffer.trim(); finalBuffer = ''; if (text && acceptable(text)) sendQuery(text); }
+function restartRecognition() { if (!isMicActive || !recognition || recognitionRunning) return; clearTimeout(restartTimer); restartTimer = setTimeout(() => { if (isMicActive && !recognitionRunning) { try { recognition.lang = language(); recognition.start(); } catch (_) {} } }, 200); }
 
 function setupSpeechRecognition() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) { showError('Speech recognition is not supported in this browser. Use current Chrome.'); return false; }
-  recognition = new SR();
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.maxAlternatives = 3;
-  recognition.lang = language();
-
+  recognition = new SR(); recognition.continuous = true; recognition.interimResults = true; recognition.maxAlternatives = 3; recognition.lang = language();
   recognition.onstart = () => { recognitionRunning = true; recordEvent('speech_recognition_started', { language: recognition.lang }); };
   recognition.onend = () => { recognitionRunning = false; recordEvent('speech_recognition_ended'); restartRecognition(); };
-  recognition.onerror = (e) => {
-    recognitionRunning = false;
-    recordEvent('speech_recognition_error', { error: e.error });
-    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { isMicActive = false; showError('Microphone permission was denied. Allow microphone access for this site.'); setState('IDLE', 'Allow microphone access and try again.'); return; }
-    if (e.error !== 'aborted' && e.error !== 'no-speech') showError(`Speech recognition error: ${e.error}`);
-    restartRecognition();
-  };
+  recognition.onerror = (e) => { recognitionRunning = false; recordEvent('speech_recognition_error', { error: e.error }); if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { isMicActive = false; showError('Microphone permission was denied. Allow microphone access for this site.'); setState('IDLE', 'Allow microphone access and try again.'); return; } if (e.error !== 'aborted' && e.error !== 'no-speech') showError(`Speech recognition error: ${e.error}`); restartRecognition(); };
   recognition.onresult = (event) => {
-    let interim = '';
-    let finalText = '';
-    for (let i = event.resultIndex; i < event.results.length; i += 1) {
-      const result = event.results[i];
-      const best = result[0]?.transcript?.trim() || '';
-      if (result.isFinal) finalText += `${best} `;
-      else interim += `${best} `;
-    }
+    let interim = '', finalText = '';
+    for (let i = event.resultIndex; i < event.results.length; i += 1) { const result = event.results[i]; const best = result[0]?.transcript?.trim() || ''; if (result.isFinal) finalText += `${best} `; else interim += `${best} `; }
     const candidate = (finalText || interim).trim();
-    if ((currentState === 'SPEAKING' || currentState === 'THINKING') && bargeInTask !== currentTaskId && candidate && acceptable(candidate)) {
-      bargeInTask = currentTaskId;
-      beginInterruption('Voice barge-in detected');
-    }
-    if (finalText.trim() && performance.now() >= ignoreRecognitionUntil) {
-      finalBuffer = `${finalBuffer} ${finalText.trim()}`.trim();
-      clearTimeout(finalTimer);
-      finalTimer = setTimeout(flushFinal, 300);
-    }
+    if ((currentState === 'SPEAKING' || currentState === 'THINKING') && bargeInTask !== currentTaskId && candidate && acceptable(candidate)) { bargeInTask = currentTaskId; beginInterruption('Voice barge-in detected'); }
+    if (finalText.trim() && performance.now() >= ignoreRecognitionUntil) { finalBuffer = `${finalBuffer} ${finalText.trim()}`.trim(); clearTimeout(finalTimer); finalTimer = setTimeout(flushFinal, 300); }
     if (interim && hintEl && currentState === 'LISTENING') hintEl.textContent = interim;
   };
   return true;
 }
 
-function startListening() {
-  clearError();
-  if (!recognition && !setupSpeechRecognition()) return;
-  isMicActive = true;
-  recognition.lang = language();
-  setState('LISTENING', 'Listening… speak normally.');
-  try { if (!recognitionRunning) recognition.start(); } catch (_) { restartRecognition(); }
-}
-
-function stopListening() {
-  isMicActive = false;
-  clearTimeout(restartTimer); clearTimeout(finalTimer);
-  finalBuffer = '';
-  if (recognition) { try { recognition.stop(); } catch (_) {} }
-  recognitionRunning = false;
-  stopAudio();
-  setState('IDLE', 'Ready.');
-}
+function startListening() { clearError(); if (!recognition && !setupSpeechRecognition()) return; isMicActive = true; recognition.lang = language(); setState('LISTENING', 'Listening… speak normally.'); try { if (!recognitionRunning) recognition.start(); } catch (_) { restartRecognition(); } }
+function stopListening() { isMicActive = false; clearTimeout(restartTimer); clearTimeout(finalTimer); finalBuffer = ''; if (recognition) { try { recognition.stop(); } catch (_) {} } recognitionRunning = false; stopAudio(); setState('IDLE', 'Ready.'); }
 
 if (micBtn) micBtn.addEventListener('click', () => isMicActive ? stopListening() : startListening());
 if (stopBtn) stopBtn.addEventListener('click', () => interrupt());
@@ -312,5 +208,9 @@ if (exportBtn) exportBtn.addEventListener('click', exportEvaluation);
 if (simBtn1) simBtn1.addEventListener('click', () => sendQuery('Find laptops under sixty thousand rupees.'));
 if (simBtn2) simBtn2.addEventListener('click', () => { if (currentState === 'SPEAKING' || currentState === 'THINKING') beginInterruption('Simulation interruption'); sendQuery('Actually, make it fifty thousand rupees.'); });
 if (textForm) textForm.addEventListener('submit', (e) => { e.preventDefault(); const text = textInput?.value || ''; if (currentState === 'SPEAKING' || currentState === 'THINKING') beginInterruption('Text interruption'); sendQuery(text); if (textInput) textInput.value = ''; });
+
+// Chrome may populate voices asynchronously; loading them here makes the
+// fallback voice selection reliable on the first response.
+if ('speechSynthesis' in window) window.speechSynthesis.addEventListener('voiceschanged', () => recordEvent('speech_voices_loaded', { voice_count: window.speechSynthesis.getVoices().length }));
 
 setState('IDLE', 'Ready. Start listening when you are ready.');
