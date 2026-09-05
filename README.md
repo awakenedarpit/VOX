@@ -57,3 +57,7 @@ VOX_LIVE_TESTS=1 python3 -m unittest tests/test_interruption.py
 ```
 
 See `TESTING.md` for the manual acceptance procedure and metric definitions. Do not report measurements that have not actually been observed and recorded.
+
+## Conversation history
+
+VOX keeps up to 15 user-assistant turns for the current service tab session. Each tab receives a unique session ID through browser `sessionStorage`, so separate tabs, browsers, devices, or browser profiles receive separate histories. Reloading the same tab restores its active service history; closing the tab starts a new service history. The backend stores the recent turns locally in `backend/data/conversation_history.json`, which is ignored by Git.

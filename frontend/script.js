@@ -12,12 +12,12 @@ const DEFAULT_SPEECH_LANGUAGE = 'en-IN';
 const connectionStatus = $('connection-status'), connectionLabel = $('connection-label');
 const memoryStatusEl = $('memory-status'), clearMemoryBtn = $('clear-memory-btn');
 
-const SESSION_STORAGE_KEY = 'vox-session-id';
+const SESSION_STORAGE_KEY = 'vox-service-session-id';
 function getSessionId() {
-  let id = window.localStorage?.getItem(SESSION_STORAGE_KEY);
+  let id = window.sessionStorage?.getItem(SESSION_STORAGE_KEY);
   if (!id) {
-    id = window.crypto?.randomUUID?.() || `vox-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    window.localStorage?.setItem(SESSION_STORAGE_KEY, id);
+    id = window.crypto?.randomUUID?.() || `vox-service-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    window.sessionStorage?.setItem(SESSION_STORAGE_KEY, id);
   }
   return id;
 }
@@ -52,6 +52,13 @@ let lastSubmittedTranscript = '';
 let bargeInTask = null;
 let recognitionRestartAttempts = 0;
 let interruptionCaptureUntil = 0;
+let micStream = null;
+let vadContext = null;
+let vadAnalyser = null;
+let vadFrame = null;
+let vadActive = false;
+let vadHits = 0;
+let lastVadInterruption = 0;
 
 // Chrome SpeechRecognition can return phonetic variants for technical phrases.
 // Keep corrections conservative and phrase-based so ordinary dictation is not
@@ -182,6 +189,68 @@ async function restoreConversation() {
   } catch (_) { /* memory restoration is non-blocking */ }
 }
 
+function stopVoiceActivityMonitor() {
+  vadActive = false;
+  if (vadFrame) cancelAnimationFrame(vadFrame);
+  vadFrame = null;
+  if (vadContext) { vadContext.close().catch(() => {}); vadContext = null; }
+  if (micStream) { micStream.getTracks().forEach(track => track.stop()); micStream = null; }
+  vadAnalyser = null; vadHits = 0;
+}
+
+async function startVoiceActivityMonitor() {
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+  if (vadActive || !navigator.mediaDevices?.getUserMedia || !AudioContextCtor) return;
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    vadContext = new AudioContextCtor();
+    const source = vadContext.createMediaStreamSource(micStream);
+    vadAnalyser = vadContext.createAnalyser();
+    vadAnalyser.fftSize = 512;
+    vadAnalyser.smoothingTimeConstant = 0.18;
+    source.connect(vadAnalyser);
+    const samples = new Uint8Array(vadAnalyser.fftSize);
+    vadActive = true;
+    const monitor = () => {
+      if (!vadActive || !vadAnalyser) return;
+      vadAnalyser.getByteTimeDomainData(samples);
+      let energy = 0;
+      for (let i = 0; i < samples.length; i += 1) { const deviation = (samples[i] - 128) / 128; energy += deviation * deviation; }
+      const rms = Math.sqrt(energy / samples.length);
+      const responseActive = currentState === 'SPEAKING' || currentState === 'THINKING';
+      if (responseActive && rms > 0.045) vadHits += 1; else vadHits = Math.max(0, vadHits - 1);
+      if (responseActive && vadHits >= 3 && performance.now() - lastVadInterruption > 900) {
+        lastVadInterruption = performance.now(); vadHits = 0;
+        recordEvent('voice_activity_barge_in', { rms: Number(rms.toFixed(4)) });
+        beginInterruption('Voice activity detected');
+      }
+      vadFrame = requestAnimationFrame(monitor);
+    };
+    monitor();
+    recordEvent('voice_activity_monitor_started');
+  } catch (err) {
+    recordEvent('voice_activity_monitor_unavailable', { error: err.name || 'unknown' });
+    stopVoiceActivityMonitor();
+  }
+}
+
+function ensureBargeInRecognition() {
+  if (!recognition && !setupSpeechRecognition()) return false;
+  isMicActive = true;
+  startVoiceActivityMonitor();
+  if (!recognitionRunning) {
+    try {
+      recognition.lang = language();
+      recognition.start();
+      recordEvent('barge_in_listener_requested');
+    } catch (_) {
+      recognitionRestartAttempts += 1;
+      restartRecognition();
+    }
+  }
+  return true;
+}
+
 function stopAudio() {
   const t = performance.now(); let stopped = false;
   if (activeAudio) { activeAudio.onended = null; activeAudio.onerror = null; activeAudio.pause(); try { activeAudio.currentTime = 0; } catch (_) {} activeAudio.removeAttribute('src'); activeAudio.load(); activeAudio = null; stopped = true; }
@@ -222,6 +291,9 @@ async function sendQuery(text) {
     const data = await res.json(); setConnectionState(true); updateMemoryStatus(data.memory); recordEvent('llm_completed', { response_task_id: data.task_id, memory_turns: data.memory?.turns || 0 });
     if (taskId !== currentTaskId) { recordEvent('stale_result_discarded', { stale_task_id: taskId, active_task_id: currentTaskId }); const trial = interruptionTrials.find(t => t.new_task_id === currentTaskId && t.recovery_success === null); if (trial) trial.stale_results += 1; return; }
     activeResponseText = data.text || ''; addMessage('vox', activeResponseText, taskId);
+    // Keep the microphone listener active while VOX speaks so the user can barge in
+    // without having to press Start Listening again.
+    ensureBargeInRecognition();
     if (data.audio_base64) playRimeAudio(data.audio_base64, data.audio_format, taskId); else speakFallback(activeResponseText, taskId);
   } catch (err) {
     if (err.name === 'AbortError') recordEvent('request_aborted', { aborted_task_id: taskId });
@@ -308,15 +380,17 @@ function setupSpeechRecognition() {
     let interim = '', finalText = '';
     for (let i = event.resultIndex; i < event.results.length; i += 1) { const result = event.results[i]; const best = selectRecognitionTranscript(result); if (result.isFinal) finalText += `${best} `; else interim += `${best} `; }
     const candidate = correctTechnicalTranscript((finalText || interim).trim());
-    if ((currentState === 'SPEAKING' || currentState === 'THINKING') && bargeInTask !== currentTaskId && candidate && acceptable(candidate)) { bargeInTask = currentTaskId; beginInterruption('Voice barge-in detected'); }
+    const speechDuringResponse = currentState === 'SPEAKING' || currentState === 'THINKING';
+    const isFreshSpeech = candidate && candidate !== lastSubmittedTranscript && !isEcho(candidate);
+    if (speechDuringResponse && bargeInTask !== currentTaskId && isFreshSpeech) { beginInterruption('Voice barge-in detected'); }
     if (finalText.trim() && (performance.now() >= ignoreRecognitionUntil || performance.now() <= interruptionCaptureUntil)) { finalBuffer = `${finalBuffer} ${finalText.trim()}`.trim(); clearTimeout(finalTimer); finalTimer = setTimeout(flushFinal, 220); }
     if (interim && hintEl && currentState === 'LISTENING') hintEl.textContent = correctTechnicalTranscript(interim);
   };
   return true;
 }
 
-function startListening() { clearError(); if (!recognition && !setupSpeechRecognition()) return; isMicActive = true; recognition.lang = language(); setState('LISTENING', 'Listening… speak normally.'); try { if (!recognitionRunning) recognition.start(); } catch (_) { recognitionRestartAttempts += 1; restartRecognition(); } }
-function stopListening() { isMicActive = false; clearTimeout(restartTimer); restartTimer = null; clearTimeout(finalTimer); finalBuffer = ''; recognitionRestartAttempts = 0; if (recognition) { try { recognition.stop(); } catch (_) {} } recognitionRunning = false; stopAudio(); setState('IDLE', 'Ready.'); }
+function startListening() { clearError(); if (!recognition && !setupSpeechRecognition()) return; isMicActive = true; startVoiceActivityMonitor(); recognition.lang = language(); setState('LISTENING', 'Listening… speak normally.'); try { if (!recognitionRunning) recognition.start(); } catch (_) { recognitionRestartAttempts += 1; restartRecognition(); } }
+function stopListening() { isMicActive = false; clearTimeout(restartTimer); restartTimer = null; clearTimeout(finalTimer); finalBuffer = ''; recognitionRestartAttempts = 0; stopVoiceActivityMonitor(); if (recognition) { try { recognition.stop(); } catch (_) {} } recognitionRunning = false; stopAudio(); setState('IDLE', 'Ready.'); }
 
 if (micBtn) micBtn.addEventListener('click', () => isMicActive ? stopListening() : startListening());
 if (stopBtn) stopBtn.addEventListener('click', () => interrupt());
