@@ -15,13 +15,21 @@ const languageSelect = $('speech-language');
 // e.g. ...-5500.app.github.dev -> ...-8000.app.github.dev.
 function resolveApiBase() {
   if (window.VOX_API_BASE) return window.VOX_API_BASE.replace(/\/$/, '');
+
   const host = window.location.hostname;
+
+  // When VOX is served directly by FastAPI, use the current origin.
+  // This is required for GitHub Codespaces forwarded ports.
+  if (host.endsWith('.app.github.dev')) {
+    return window.location.origin;
+  }
+
+  // Local development on port 8000.
   if (host === 'localhost' || host === '127.0.0.1' || host === '[::1]') {
     return `${window.location.protocol}//${host}:8000`;
   }
-  const remoteHost = host.replace(/-\d+(?=\.)/, '-8000');
-  if (remoteHost !== host) return `${window.location.protocol}//${remoteHost}`;
-  return `${window.location.protocol}//${host}:8000`;
+
+  return window.location.origin;
 }
 const API_BASE = resolveApiBase();
 
