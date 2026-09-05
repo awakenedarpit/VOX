@@ -1,6 +1,8 @@
 import os, base64, re, html, json
 from pathlib import Path
 from collections import deque
+import asyncio
+import logging
 from urllib.parse import unquote
 
 # pyrefly: ignore [missing-import]
@@ -20,6 +22,10 @@ if _env_path.exists(): load_dotenv(dotenv_path=_env_path, override=True)
 else: load_dotenv(override=True)
 
 app = FastAPI(title='VOX API')
+logger = logging.getLogger('vox')
+UPSTREAM_RETRIES = max(1, int(os.getenv('VOX_UPSTREAM_RETRIES', '3')))
+HISTORY_CONTEXT_CHARS = max(4000, int(os.getenv('VOX_HISTORY_CONTEXT_CHARS', '12000')))
+_provider_gate = asyncio.Semaphore(2)
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 
 class ChatRequest(BaseModel):
@@ -103,14 +109,25 @@ def _system_prompt(language):
 Conversation matters. Short follow-ups modify the previous request and inherit unchanged constraints. Never reject a short follow-up.
 Answer the CURRENT request directly. Never claim to have searched or accessed live data unless LIVE PRODUCT SEARCH CONTEXT is supplied below. For voice output, use short natural sentences. The user's speech language is {LANGUAGE_NAMES.get(language,language)}. Understand mixed English/Hindi naturally.'''
 
+def _bounded_history(history):
+    selected=[]; total=0
+    for item in reversed(list(history)[-HISTORY_MESSAGES:]):
+        content=str(item.get('content',''))
+        if not content: continue
+        remaining=max(0, HISTORY_CONTEXT_CHARS-total)
+        if remaining <= 0: break
+        clipped=content[:remaining]
+        selected.append({'role':item.get('role','user'),'content':clipped})
+        total += len(clipped)
+    return list(reversed(selected))
+
 def build_messages(text,language,session_id,product_context=''):
     messages=[{'role':'system','content':_system_prompt(language)}]
     history=conversation_memory.get(session_id or 'local-demo',deque())
-    # Always provide recent conversation context, not only obvious follow-ups.
-    # This lets VOX answer references such as "what about the second one?"
-    # even when the new utterance does not contain a follow-up keyword.
+    # Always provide recent conversation context, but keep the request bounded so
+    # long product answers do not exhaust the upstream gateway after many turns.
     if history:
-        messages.extend(list(history)[-HISTORY_MESSAGES:])
+        messages.extend(_bounded_history(history))
     if is_follow_up(text) and history:
         messages.append({'role':'system','content':'This is a follow-up to the immediately previous request. Carry forward the previous subject and constraints. If the user says “actually, make it ₹50,000” after asking for laptops under ₹60,000, treat it as the same laptop search with a ₹50,000 limit.'})
     if product_context: messages.append({'role':'system','content':product_context})
@@ -143,12 +160,44 @@ async def _ollama_chat(messages,model):
     async with httpx.AsyncClient(timeout=45) as c:
         r=await c.post('http://127.0.0.1:11434/api/chat',json=payload); r.raise_for_status(); return (r.json().get('message',{}).get('content') or '').strip()
 
+def _response_error(response, provider):
+    content_type=response.headers.get('content-type','').lower()
+    if 'html' in content_type or response.text.lstrip().lower().startswith('<!doctype') or response.text.lstrip().lower().startswith('<html'):
+        return f'{provider} returned an HTML gateway response (HTTP {response.status_code})'
+    try:
+        data=response.json()
+        detail=data.get('error',{}).get('message') if isinstance(data.get('error'),dict) else data.get('message')
+        if detail: return f'{provider} returned HTTP {response.status_code}: {str(detail)[:240]}'
+    except Exception:
+        pass
+    return f'{provider} returned HTTP {response.status_code}: {response.text[:240]}'
+
+async def _chat_completion_request(url, payload, headers, provider, timeout=45):
+    last_error=None
+    async with _provider_gate:
+        for attempt in range(UPSTREAM_RETRIES):
+            try:
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
+                    response=await c.post(url,json=payload,headers=headers)
+                if 200 <= response.status_code < 300:
+                    try: return response.json()
+                    except ValueError as e: raise RuntimeError(f'{provider} returned invalid JSON') from e
+                detail=_response_error(response,provider)
+                if response.status_code not in {408,425,429} and not 500 <= response.status_code <= 599:
+                    raise RuntimeError(detail)
+                last_error=RuntimeError(detail)
+            except (httpx.ConnectError,httpx.ConnectTimeout,httpx.ReadTimeout,httpx.ReadError,httpx.RemoteProtocolError) as e:
+                last_error=RuntimeError(f'{provider} connection interrupted: {type(e).__name__}')
+            if attempt < UPSTREAM_RETRIES - 1:
+                await asyncio.sleep(0.35 * (2 ** attempt))
+    raise last_error or RuntimeError(f'{provider} request failed')
+
 async def _groq_chat(messages):
     key=os.getenv('GROQ_API_KEY','').strip(); model=os.getenv('GROQ_LLM_MODEL','openai/gpt-oss-20b').strip()
     if not key or key=='your_groq_api_key_here': raise RuntimeError('GROQ_API_KEY is not configured')
     payload={'model':model,'messages':messages,'temperature':0.2,'top_p':0.9,'max_completion_tokens':500}
-    async with httpx.AsyncClient(timeout=30) as c:
-        r=await c.post('https://api.groq.com/openai/v1/chat/completions',json=payload,headers={'Authorization':f'Bearer {key}','Content-Type':'application/json'}); r.raise_for_status(); return (r.json().get('choices',[{}])[0].get('message',{}).get('content') or '').strip()
+    data=await _chat_completion_request('https://api.groq.com/openai/v1/chat/completions',payload,{'Authorization':f'Bearer {key}','Content-Type':'application/json'},'Groq',30)
+    return (data.get('choices',[{}])[0].get('message',{}).get('content') or '').strip()
 
 async def _openai_chat(messages):
     key=os.getenv('OPENAI_API_KEY','').strip()
@@ -157,10 +206,8 @@ async def _openai_chat(messages):
     if not key or key=='your_openai_api_key_here': raise RuntimeError('OPENAI_API_KEY is not configured')
     payload={'model':model,'messages':messages,'max_completion_tokens':500}
     headers={'Authorization':f'Bearer {key}','Content-Type':'application/json'}
-    async with httpx.AsyncClient(timeout=45) as c:
-        r=await c.post(f'{base}/chat/completions',json=payload,headers=headers)
-        r.raise_for_status()
-        return (r.json().get('choices',[{}])[0].get('message',{}).get('content') or '').strip()
+    data=await _chat_completion_request(f'{base}/chat/completions',payload,headers,'OpenAI-compatible provider',45)
+    return (data.get('choices',[{}])[0].get('message',{}).get('content') or '').strip()
 
 def _configured_provider():
     provider=os.getenv('LLM_PROVIDER','auto').strip().lower()
@@ -199,7 +246,12 @@ async def ask_ollama(text,language='en-IN',session_id='local-demo'):
             retry=messages+[{'role':'system','content':'Retry: answer the exact request directly. If LIVE PRODUCT SEARCH CONTEXT is present, use it and do not say you cannot access product data.'}]
             answer=_clean_voice_answer(await generate(retry))
         answer=answer or "I couldn't generate a useful answer to that request."; remember_turn(session_id,text.strip(),answer); return answer
-    except Exception as e: return f'[LLM Error: {type(e).__name__} - Check the configured {_configured_provider()} service and model.]'
+    except Exception as e:
+        logger.warning('LLM request failed for provider %s: %s', _configured_provider(), str(e)[:300])
+        detail=str(e).lower()
+        if 'html gateway' in detail or 'connection interrupted' in detail or 'http 502' in detail or 'http 503' in detail or 'http 504' in detail:
+            return '[LLM temporarily unavailable: the upstream AI service had a transient gateway problem. Please try again.]'
+        return f'[LLM Error: {type(e).__name__} - Check the configured {_configured_provider()} service and model.]'
 
 def _last_product_context(session_id):
     history=conversation_memory.get(session_id or 'local-demo',deque())
@@ -209,17 +261,28 @@ def _last_product_context(session_id):
 async def rime_tts(text):
     key=os.getenv('RIME_API_KEY','').strip(); endpoint=os.getenv('RIME_ENDPOINT','https://users.rime.ai/v1/rime-tts').strip(); model=os.getenv('RIME_MODEL','coda').strip(); speaker=os.getenv('RIME_SPEAKER','celeste').strip()
     if not key or key=='your_rime_api_key_here': return None,None,'RIME_API_KEY is not configured in .env'
-    try:
-        async with httpx.AsyncClient(timeout=45) as c:
-            r=await c.post(endpoint,json={'modelId':model,'speaker':speaker,'text':text,'lang':'en'},headers={'Authorization':f'Bearer {key}','Content-Type':'application/json','Accept':'audio/mp3'})
-            if r.status_code!=200:return None,None,f'Rime API returned HTTP {r.status_code}: {r.text[:200]}'
-            ct=r.headers.get('content-type','audio/mp3')
-            if 'audio' in ct or 'mpeg' in ct or 'octet-stream' in ct:return r.content,'audio/mp3',None
-            try:
-                data=r.json(); b64=data.get('audio') or data.get('audio_base64')
-                return (base64.b64decode(b64),'audio/mp3',None) if b64 else (None,None,f'Rime returned unexpected JSON format: {list(data.keys())}')
-            except Exception:return (r.content,'audio/mp3',None) if r.content else (None,None,'Empty response received from Rime API')
-    except Exception as e:return None,None,f'Rime network error: {type(e).__name__} - {str(e)}'
+    headers={'Authorization':f'Bearer {key}','Content-Type':'application/json','Accept':'audio/mp3'}
+    payload={'modelId':model,'speaker':speaker,'text':text,'lang':'en'}
+    last_error=None
+    for attempt in range(UPSTREAM_RETRIES):
+        try:
+            async with httpx.AsyncClient(timeout=45, follow_redirects=True) as c:
+                r=await c.post(endpoint,json=payload,headers=headers)
+            if r.status_code != 200:
+                detail=_response_error(r,'Rime')
+                if r.status_code not in {408,425,429} and not 500 <= r.status_code <= 599: return None,None,detail
+                last_error=detail
+            else:
+                ct=r.headers.get('content-type','audio/mp3')
+                if 'audio' in ct or 'mpeg' in ct or 'octet-stream' in ct:return r.content,'audio/mp3',None
+                try:
+                    data=r.json(); b64=data.get('audio') or data.get('audio_base64')
+                    return (base64.b64decode(b64),'audio/mp3',None) if b64 else (None,None,f'Rime returned unexpected JSON format: {list(data.keys())}')
+                except Exception:return (r.content,'audio/mp3',None) if r.content else (None,None,'Empty response received from Rime API')
+        except (httpx.ConnectError,httpx.ConnectTimeout,httpx.ReadTimeout,httpx.ReadError,httpx.RemoteProtocolError) as e:
+            last_error=f'Rime network error: {type(e).__name__}'
+        if attempt < UPSTREAM_RETRIES - 1: await asyncio.sleep(0.35 * (2 ** attempt))
+    return None,None,last_error or 'Rime synthesis failed after retries'
 
 @app.get('/health')
 async def health():
