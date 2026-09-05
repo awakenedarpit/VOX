@@ -15,17 +15,16 @@ cd backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn main:app --reload
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Serve the frontend:
+The FastAPI app serves both the API and the frontend from the same origin. Open:
 
-```bash
-cd frontend
-python3 -m http.server 5500
-```
+`http://localhost:8000`
 
-Open `http://127.0.0.1:5500`.
+Do not start a separate frontend server on port 5500; the frontend resolves its API relative to the single port-8000 origin.
+
+When VOX is launched inside a remote sandbox, `localhost:8000` is local to that sandbox and is not reachable from the user's own computer. Use the sandbox's forwarded/public port-8000 URL to open it externally. If running on your own computer, run the command above there and then open `http://localhost:8000` in that same computer's browser.
 
 Copy `.env.example` to `.env` and add real Rime configuration. Never commit `.env`.
 

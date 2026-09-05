@@ -8,7 +8,20 @@ const taskMetric = $('task-metric'), latencyMetric = $('latency-metric');
 const simBtn1 = $('sim-btn-1'), simBtn2 = $('sim-btn-2');
 const textForm = $('text-form'), textInput = $('text-input'), clearBtn = $('clear-btn');
 const evalBtn = $('eval-btn'), exportBtn = $('export-eval-btn'), evalSummaryEl = $('eval-summary');
-const languageSelect = $('speech-language');
+const DEFAULT_SPEECH_LANGUAGE = 'en-IN';
+const connectionStatus = $('connection-status'), connectionLabel = $('connection-label');
+const memoryStatusEl = $('memory-status'), clearMemoryBtn = $('clear-memory-btn');
+
+const SESSION_STORAGE_KEY = 'vox-session-id';
+function getSessionId() {
+  let id = window.localStorage?.getItem(SESSION_STORAGE_KEY);
+  if (!id) {
+    id = window.crypto?.randomUUID?.() || `vox-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    window.localStorage?.setItem(SESSION_STORAGE_KEY, id);
+  }
+  return id;
+}
+const sessionId = getSessionId();
 
 // Resolve the API correctly in both local Chrome and remote Codespaces.
 // Codespaces forwards each port using a hostname containing the port number,
@@ -37,6 +50,47 @@ let finalBuffer = '';
 let finalTimer = null;
 let lastSubmittedTranscript = '';
 let bargeInTask = null;
+let recognitionRestartAttempts = 0;
+let interruptionCaptureUntil = 0;
+
+// Chrome SpeechRecognition can return phonetic variants for technical phrases.
+// Keep corrections conservative and phrase-based so ordinary dictation is not
+// rewritten. The canonical phrase is used both in the visible transcript and
+// in the text sent to the backend.
+const TECHNICAL_TRANSCRIPT_REPLACEMENTS = [
+  { pattern: /\b(?:agentic|identic|identical|sentic|genetic|agent)\s+(?:ai|a\s+i|aye|eye|i|event\s+type)\b/gi, replacement: 'Agentic AI' },
+  { pattern: /\b(?:agent)\s+tic\s+(?:ai|a\s+i|aye|eye)\b/gi, replacement: 'Agentic AI' },
+  { pattern: /\b(?:identic|sentic)\b/gi, replacement: 'Agentic' },
+];
+
+function correctTechnicalTranscript(text) {
+  let corrected = text || '';
+  TECHNICAL_TRANSCRIPT_REPLACEMENTS.forEach(({ pattern, replacement }) => {
+    corrected = corrected.replace(pattern, replacement);
+  });
+  return corrected.replace(/\s+/g, ' ').trim();
+}
+
+function selectRecognitionTranscript(result) {
+  const candidates = Array.from(result || {})
+    .map((alternative) => alternative?.transcript?.trim() || '')
+    .filter(Boolean);
+  if (!candidates.length) return '';
+  const score = (candidate) => {
+    const normalized = candidate.toLowerCase();
+    let value = Math.min(candidate.length, 80) / 100;
+    if (/\b(?:ai|a\s+i|aye|eye)\b/.test(normalized)) value += 4;
+    if (/\b(?:agentic|identic|identical|sentic|event\s+type)\b/.test(normalized)) value += 2;
+    if (correctTechnicalTranscript(candidate) !== candidate) value += 10;
+    return value;
+  };
+  return candidates.sort((a, b) => score(b) - score(a))[0];
+}
+
+// Exposed only for local QA in the browser console; it does not affect the
+// application flow or send any data anywhere.
+window.VOX_DEBUG = window.VOX_DEBUG || {};
+window.VOX_DEBUG.correctTechnicalTranscript = correctTechnicalTranscript;
 
 const evaluationEvents = [];
 const interruptionTrials = [];
@@ -96,7 +150,37 @@ function acceptable(text) {
   if (isEcho(t)) { recordEvent('recognition_echo_ignored', { text_length: t.length }); return false; }
   return true;
 }
-function language() { return languageSelect?.value || 'en-IN'; }
+function language() { return DEFAULT_SPEECH_LANGUAGE; }
+function setConnectionState(online) {
+  if (!connectionStatus || !connectionLabel) return;
+  connectionStatus.className = `status-pill ${online ? 'online' : 'offline'}`;
+  connectionLabel.textContent = online ? 'Connected' : 'Offline';
+}
+function updateMemoryStatus(data = {}) {
+  if (!memoryStatusEl) return;
+  const turns = Number(data.turns || 0), maxTurns = Number(data.max_turns || 15);
+  memoryStatusEl.textContent = `${Math.min(turns, maxTurns)} / ${maxTurns} turns`;
+}
+async function refreshConnection() {
+  try {
+    const res = await fetch(`${API_BASE}/health`, { cache: 'no-store' });
+    if (!res.ok) throw new Error('health check failed');
+    setConnectionState(true);
+    const memoryRes = await fetch(`${API_BASE}/memory?session_id=${encodeURIComponent(sessionId)}`, { cache: 'no-store' });
+    if (memoryRes.ok) updateMemoryStatus(await memoryRes.json());
+  } catch (_) { setConnectionState(false); }
+}
+async function restoreConversation() {
+  try {
+    const res = await fetch(`${API_BASE}/memory/history?session_id=${encodeURIComponent(sessionId)}`, { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json(); updateMemoryStatus(data);
+    if (!Array.isArray(data.history) || !data.history.length || !transcriptEl) return;
+    transcriptEl.innerHTML = '';
+    data.history.forEach((turn) => addMessage(turn.role === 'user' ? 'user' : 'vox', turn.content, 'memory'));
+    const marker = document.createElement('div'); marker.className = 'msg system memory-restored'; marker.textContent = 'Recent conversation restored from VOX memory.'; transcriptEl.prepend(marker);
+  } catch (_) { /* memory restoration is non-blocking */ }
+}
 
 function stopAudio() {
   const t = performance.now(); let stopped = false;
@@ -109,8 +193,11 @@ function stopAudio() {
 
 function beginInterruption(reason = 'Voice barge-in detected') {
   if (currentState !== 'SPEAKING' && currentState !== 'THINKING') return null;
+  if (bargeInTask === currentTaskId) return null;
   const detected = performance.now(), oldTask = currentTaskId, cutoff = stopAudio();
-  currentTaskId += 1; activeResponseText = ''; bargeInTask = currentTaskId; ignoreRecognitionUntil = performance.now() + 250;
+  clearTimeout(finalTimer); finalBuffer = '';
+  currentTaskId += 1; activeResponseText = ''; bargeInTask = currentTaskId; interruptionCaptureUntil = performance.now() + 1200; ignoreRecognitionUntil = performance.now() + 80;
+  window.setTimeout(() => { if (isMicActive && recognition && !recognitionRunning) restartRecognition(); }, 100);
   pendingRecovery = { trial_id: interruptionTrials.length + 1, interrupted_task_id: oldTask, new_task_id: currentTaskId, interruption_detected_at: detected, cutoff_latency_ms: cutoff, recovery_time_ms: null, stale_results: 0, recovery_success: null, reason };
   interruptionTrials.push(pendingRecovery); if (taskMetric) taskMetric.textContent = `#${currentTaskId}`;
   recordEvent('interruption_detected', { reason, interrupted_task_id: oldTask }); recordEvent('task_invalidated', { invalidated_task_id: oldTask });
@@ -119,9 +206,10 @@ function beginInterruption(reason = 'Voice barge-in detected') {
 function interrupt(reason = 'Manual interruption') { return beginInterruption(reason); }
 
 async function sendQuery(text) {
-  const cleaned = text.trim().replace(/\s+/g, ' '); if (!acceptable(cleaned)) return;
-  lastSubmittedTranscript = cleaned; clearError();
+  const cleaned = text.trim().replace(/\s+/g, ' ');
   const recovery = pendingRecovery && pendingRecovery.new_task_id === currentTaskId && pendingRecovery.recovery_success === null;
+  if (!cleaned || (!recovery && !acceptable(cleaned))) return;
+  lastSubmittedTranscript = cleaned; clearError();
   const taskId = recovery ? currentTaskId : ++currentTaskId;
   if (taskMetric) taskMetric.textContent = `#${taskId}`; bargeInTask = null; activeResponseText = '';
   recordEvent('task_created', { task_id_created: taskId, input_source: 'browser-speech-recognition', speech_language: language(), recovery_task: recovery, api_base: API_BASE });
@@ -129,9 +217,9 @@ async function sendQuery(text) {
   if (currentAbortController) currentAbortController.abort(); currentAbortController = new AbortController();
   try {
     recordEvent('llm_started');
-    const res = await fetch(`${API_BASE}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: cleaned, task_id: taskId, language: language() }), signal: currentAbortController.signal });
+    const res = await fetch(`${API_BASE}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: cleaned, task_id: taskId, language: language(), session_id: sessionId }), signal: currentAbortController.signal });
     if (!res.ok) throw new Error(`Server returned ${res.status}: ${await res.text()}`);
-    const data = await res.json(); recordEvent('llm_completed', { response_task_id: data.task_id });
+    const data = await res.json(); setConnectionState(true); updateMemoryStatus(data.memory); recordEvent('llm_completed', { response_task_id: data.task_id, memory_turns: data.memory?.turns || 0 });
     if (taskId !== currentTaskId) { recordEvent('stale_result_discarded', { stale_task_id: taskId, active_task_id: currentTaskId }); const trial = interruptionTrials.find(t => t.new_task_id === currentTaskId && t.recovery_success === null); if (trial) trial.stale_results += 1; return; }
     activeResponseText = data.text || ''; addMessage('vox', activeResponseText, taskId);
     if (data.audio_base64) playRimeAudio(data.audio_base64, data.audio_format, taskId); else speakFallback(activeResponseText, taskId);
@@ -139,6 +227,16 @@ async function sendQuery(text) {
     if (err.name === 'AbortError') recordEvent('request_aborted', { aborted_task_id: taskId });
     else if (taskId === currentTaskId) { const detail = err instanceof TypeError && err.message === 'Failed to fetch' ? `Cannot connect to VOX backend at ${API_BASE}. Make sure port 8000 is running and forwarded.` : `Error: ${err.message}`; showError(detail); setState(isMicActive ? 'LISTENING' : 'IDLE', 'Backend connection failed.'); }
   }
+}
+
+async function clearConversationMemory() {
+  if (!window.confirm('Clear VOX memory for this browser session?')) return;
+  try {
+    const res = await fetch(`${API_BASE}/memory?session_id=${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error('memory clear failed');
+    const data = await res.json(); updateMemoryStatus(data);
+    if (transcriptEl) transcriptEl.innerHTML = '<div class="msg system">Memory cleared. VOX is ready for a fresh conversation.</div>';
+  } catch (err) { showError(`Could not clear memory: ${err.message}`); }
 }
 
 function markRecovery(taskId) {
@@ -175,34 +273,55 @@ function speakFallback(text, taskId) {
   window.speechSynthesis.speak(u);
 }
 
-function flushFinal() { clearTimeout(finalTimer); const text = finalBuffer.trim(); finalBuffer = ''; if (text && acceptable(text)) sendQuery(text); }
-function restartRecognition() { if (!isMicActive || !recognition || recognitionRunning) return; clearTimeout(restartTimer); restartTimer = setTimeout(() => { if (isMicActive && !recognitionRunning) { try { recognition.lang = language(); recognition.start(); } catch (_) {} } }, 200); }
+function flushFinal() {
+  clearTimeout(finalTimer);
+  const original = finalBuffer.trim();
+  finalBuffer = '';
+  const text = correctTechnicalTranscript(original);
+  if (text && text !== original) recordEvent('recognition_transcript_corrected', { original_text: original, corrected_text: text });
+  if (text && acceptable(text)) sendQuery(text);
+}
+function restartRecognition() {
+  if (!isMicActive || !recognition || recognitionRunning || restartTimer) return;
+  const delay = Math.min(1200, 180 + recognitionRestartAttempts * 180);
+  restartTimer = setTimeout(() => {
+    restartTimer = null;
+    if (!isMicActive || recognitionRunning) return;
+    try {
+      recognition.lang = language();
+      recognition.start();
+    } catch (_) {
+      recognitionRestartAttempts += 1;
+      restartRecognition();
+    }
+  }, delay);
+}
 
 function setupSpeechRecognition() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) { showError('Speech recognition is not supported in this browser. Use current Chrome.'); return false; }
-  recognition = new SR(); recognition.continuous = true; recognition.interimResults = true; recognition.maxAlternatives = 3; recognition.lang = language();
-  recognition.onstart = () => { recognitionRunning = true; recordEvent('speech_recognition_started', { language: recognition.lang }); };
+  recognition = new SR(); recognition.continuous = true; recognition.interimResults = true; recognition.maxAlternatives = 5; recognition.lang = language();
+  recognition.onstart = () => { recognitionRunning = true; recognitionRestartAttempts = 0; recordEvent('speech_recognition_started', { language: recognition.lang }); };
   recognition.onend = () => { recognitionRunning = false; recordEvent('speech_recognition_ended'); restartRecognition(); };
-  recognition.onerror = (e) => { recognitionRunning = false; recordEvent('speech_recognition_error', { error: e.error }); if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { isMicActive = false; showError('Microphone permission was denied. Allow microphone access for this site.'); setState('IDLE', 'Allow microphone access and try again.'); return; } if (e.error !== 'aborted' && e.error !== 'no-speech') showError(`Speech recognition error: ${e.error}`); restartRecognition(); };
+  recognition.onerror = (e) => { recognitionRunning = false; recordEvent('speech_recognition_error', { error: e.error }); if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { isMicActive = false; showError('Microphone permission was denied. Allow microphone access for this site.'); setState('IDLE', 'Allow microphone access and try again.'); return; } if (e.error !== 'aborted' && e.error !== 'no-speech') showError(`Speech recognition error: ${e.error}`); recognitionRestartAttempts += 1; restartRecognition(); };
   recognition.onresult = (event) => {
     let interim = '', finalText = '';
-    for (let i = event.resultIndex; i < event.results.length; i += 1) { const result = event.results[i]; const best = result[0]?.transcript?.trim() || ''; if (result.isFinal) finalText += `${best} `; else interim += `${best} `; }
-    const candidate = (finalText || interim).trim();
+    for (let i = event.resultIndex; i < event.results.length; i += 1) { const result = event.results[i]; const best = selectRecognitionTranscript(result); if (result.isFinal) finalText += `${best} `; else interim += `${best} `; }
+    const candidate = correctTechnicalTranscript((finalText || interim).trim());
     if ((currentState === 'SPEAKING' || currentState === 'THINKING') && bargeInTask !== currentTaskId && candidate && acceptable(candidate)) { bargeInTask = currentTaskId; beginInterruption('Voice barge-in detected'); }
-    if (finalText.trim() && performance.now() >= ignoreRecognitionUntil) { finalBuffer = `${finalBuffer} ${finalText.trim()}`.trim(); clearTimeout(finalTimer); finalTimer = setTimeout(flushFinal, 300); }
-    if (interim && hintEl && currentState === 'LISTENING') hintEl.textContent = interim;
+    if (finalText.trim() && (performance.now() >= ignoreRecognitionUntil || performance.now() <= interruptionCaptureUntil)) { finalBuffer = `${finalBuffer} ${finalText.trim()}`.trim(); clearTimeout(finalTimer); finalTimer = setTimeout(flushFinal, 220); }
+    if (interim && hintEl && currentState === 'LISTENING') hintEl.textContent = correctTechnicalTranscript(interim);
   };
   return true;
 }
 
-function startListening() { clearError(); if (!recognition && !setupSpeechRecognition()) return; isMicActive = true; recognition.lang = language(); setState('LISTENING', 'Listening… speak normally.'); try { if (!recognitionRunning) recognition.start(); } catch (_) { restartRecognition(); } }
-function stopListening() { isMicActive = false; clearTimeout(restartTimer); clearTimeout(finalTimer); finalBuffer = ''; if (recognition) { try { recognition.stop(); } catch (_) {} } recognitionRunning = false; stopAudio(); setState('IDLE', 'Ready.'); }
+function startListening() { clearError(); if (!recognition && !setupSpeechRecognition()) return; isMicActive = true; recognition.lang = language(); setState('LISTENING', 'Listening… speak normally.'); try { if (!recognitionRunning) recognition.start(); } catch (_) { recognitionRestartAttempts += 1; restartRecognition(); } }
+function stopListening() { isMicActive = false; clearTimeout(restartTimer); restartTimer = null; clearTimeout(finalTimer); finalBuffer = ''; recognitionRestartAttempts = 0; if (recognition) { try { recognition.stop(); } catch (_) {} } recognitionRunning = false; stopAudio(); setState('IDLE', 'Ready.'); }
 
 if (micBtn) micBtn.addEventListener('click', () => isMicActive ? stopListening() : startListening());
 if (stopBtn) stopBtn.addEventListener('click', () => interrupt());
-if (clearBtn) clearBtn.addEventListener('click', () => { if (transcriptEl) transcriptEl.innerHTML = ''; clearError(); });
-if (languageSelect) languageSelect.addEventListener('change', () => { if (recognition) recognition.lang = language(); });
+if (clearBtn) clearBtn.addEventListener('click', () => { if (transcriptEl) transcriptEl.innerHTML = '<div class="msg system">Visible transcript cleared. VOX memory remains available.</div>'; clearError(); });
+if (clearMemoryBtn) clearMemoryBtn.addEventListener('click', clearConversationMemory);
 if (evalBtn) evalBtn.addEventListener('click', () => { const last = interruptionTrials[interruptionTrials.length - 1]; if (last && last.recovery_success === null) { last.recovery_success = true; updateEvaluationSummary(); } });
 if (exportBtn) exportBtn.addEventListener('click', exportEvaluation);
 if (simBtn1) simBtn1.addEventListener('click', () => sendQuery('Find laptops under sixty thousand rupees.'));
@@ -214,3 +333,6 @@ if (textForm) textForm.addEventListener('submit', (e) => { e.preventDefault(); c
 if ('speechSynthesis' in window) window.speechSynthesis.addEventListener('voiceschanged', () => recordEvent('speech_voices_loaded', { voice_count: window.speechSynthesis.getVoices().length }));
 
 setState('IDLE', 'Ready. Start listening when you are ready.');
+refreshConnection();
+restoreConversation();
+window.setInterval(refreshConnection, 20000);
