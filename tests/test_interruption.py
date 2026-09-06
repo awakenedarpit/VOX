@@ -3,8 +3,19 @@ import os
 import unittest
 import urllib.request
 
+from backend.main import current_time_answer, is_time_request, is_web_request
+
 
 class TestVOXInterruption(unittest.TestCase):
+    def test_time_request_is_detected_and_uses_configured_timezone(self):
+        self.assertTrue(is_time_request("What time is it right now?"))
+        self.assertIn("India Standard Time", current_time_answer("Asia/Kolkata"))
+
+    def test_web_research_request_is_detected(self):
+        self.assertTrue(is_web_request("What are the latest technologies?"))
+        self.assertTrue(is_web_request("Search online for OLED TVs"))
+        self.assertFalse(is_web_request("Tell me a joke"))
+
     def test_new_task_is_newer(self):
         """Task IDs must be strictly monotonically increasing."""
         current_task_id = 1

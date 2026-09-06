@@ -1,4 +1,7 @@
 import os, base64, re, html, json
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from xml.etree import ElementTree
 from pathlib import Path
 from collections import deque
 import asyncio
@@ -61,6 +64,8 @@ conversation_memory: dict[str, deque] = _load_conversation_memory()
 FOLLOW_UP_MARKERS = ('actually','instead','make it','change it','change that','update it','keep everything else','same thing','same one','under ','below ','increase it','decrease it','raise it','lower it','remove that','add that','add it','only change','change the budget','change the price')
 PRODUCT_TERMS = ('laptop','notebook','macbook','chromebook','tablet','phone','smartphone','monitor','headphones','earbuds','keyboard','mouse','camera','tv','television','watch','smartwatch')
 SHOPPING_TERMS = ('find','search','recommend','best','buy','price','cost','under','below','budget','cheapest','available','deal','deals','for sale')
+WEB_RESEARCH_TERMS = ('search the web','search online','look up','latest','current','today','news','technology','technologies','tech','research','insights','what is happening','recent')
+TIME_TERMS = ('what time','current time','time now','time is it','local time')
 
 def is_follow_up(text):
     n=' '.join(text.lower().split()); return any(n.startswith(m) or f' {m}' in n for m in FOLLOW_UP_MARKERS)
@@ -68,19 +73,60 @@ def is_follow_up(text):
 def is_product_request(text):
     n=text.lower(); return any(t in n for t in PRODUCT_TERMS) and any(t in n for t in SHOPPING_TERMS)
 
+def is_time_request(text):
+    n=' '.join(text.lower().split())
+    return any(term in n for term in TIME_TERMS)
+
+def is_web_request(text):
+    n=' '.join(text.lower().split())
+    return any(term in n for term in WEB_RESEARCH_TERMS) or n.startswith(('search ','find information','compare '))
+
+def current_time_answer(timezone_name=None):
+    timezone_name=timezone_name or os.getenv('VOX_TIMEZONE','Asia/Kolkata')
+    try:
+        now=datetime.now(ZoneInfo(timezone_name))
+    except Exception:
+        timezone_name='Asia/Kolkata'; now=datetime.now(ZoneInfo(timezone_name))
+    label='India Standard Time' if timezone_name == 'Asia/Kolkata' else timezone_name
+    return f"It is {now.strftime('%I:%M %p').lstrip('0')} on {now.strftime('%A, %d %B %Y')} ({label})."
+
 def product_search_query(text):
     return f'{" ".join(text.split())} India price specifications buy'
 
 async def search_products(text: str) -> list[dict]:
-    query=product_search_query(text)
+    return await search_web(product_search_query(text))
+
+async def search_web(query: str) -> list[dict]:
     headers={'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36'}
     try:
         async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=headers) as c:
             r=await c.get('https://html.duckduckgo.com/html/', params={'q':query,'kl':'in-en'})
             r.raise_for_status()
         page=r.text
+        if 'anomaly-modal' not in page:
+            return _parse_duckduckgo_results(page)
+    except Exception:
+        pass
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=headers) as c:
+            r=await c.get('https://www.bing.com/search', params={'format':'rss','q':query,'setlang':'en-IN'})
+            r.raise_for_status()
+        root=ElementTree.fromstring(r.text)
         items=[]
-        for match in re.finditer(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', page, re.S|re.I):
+        for item in root.findall('.//item'):
+            title=(item.findtext('title') or '').strip()
+            url=(item.findtext('link') or '').strip()
+            snippet=re.sub(r'<[^>]+>','',html.unescape(item.findtext('description') or '')).strip()
+            if title and url.startswith('http'): items.append({'title':title[:180],'url':url,'snippet':snippet[:500]})
+            if len(items)>=8: break
+        if items: return items
+    except Exception:
+        pass
+    return []
+
+def _parse_duckduckgo_results(page: str) -> list[dict]:
+    items=[]
+    for match in re.finditer(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', page, re.S|re.I):
             raw_url=html.unescape(match.group(1)); title=html.unescape(re.sub(r'<[^>]+>','',match.group(2))).strip()
             raw_url=unquote(raw_url)
             if 'uddg=' in raw_url:
@@ -91,9 +137,7 @@ async def search_products(text: str) -> list[dict]:
             snippet=html.unescape(re.sub(r'<[^>]+>','',sm.group(1))).strip() if sm else ''
             if title and raw_url.startswith('http'): items.append({'title':title[:180],'url':raw_url,'snippet':snippet[:500]})
             if len(items)>=8: break
-        return items
-    except Exception:
-        return []
+    return items
 
 def remember_turn(session_id,user_text,assistant_text):
     history=conversation_memory.setdefault(session_id or 'local-demo',deque(maxlen=HISTORY_MESSAGES)); history.append({'role':'user','content':user_text})
@@ -221,6 +265,10 @@ def _is_generic(a):
     n=' '.join(a.lower().split()).strip(' .!?'); return not n or n in GENERIC_RESPONSES
 
 async def ask_ollama(text,language='en-IN',session_id='local-demo'):
+    if is_time_request(text):
+        answer=current_time_answer()
+        remember_turn(session_id,text.strip(),answer)
+        return answer
     search_text=text
     if is_follow_up(text):
         previous=_last_product_context(session_id)
@@ -228,12 +276,18 @@ async def ask_ollama(text,language='en-IN',session_id='local-demo'):
     product_context=''
     if is_product_request(search_text):
         products=await search_products(search_text)
-        if products:
-            lines=['LIVE PRODUCT SEARCH CONTEXT: Current public-web results fetched for this request. Use only facts present in these results. Do not invent prices/specifications. Listings can change.']
-            for i,p in enumerate(products,1): lines.append(f'{i}. {p["title"]} | {p["snippet"]} | {p["url"]}')
-            product_context='\n'.join(lines)
-        else:
-            product_context='LIVE PRODUCT SEARCH CONTEXT: No usable public-web results were retrieved. Do not claim to have product listings. Say live listings could not be retrieved.'
+        context_label='product listings'
+    elif is_web_request(search_text):
+        products=await search_web(' '.join(search_text.split()))
+        context_label='web research results'
+    else:
+        products=[]; context_label='web results'
+    if products:
+        lines=[f'LIVE WEB CONTEXT: Current public-web {context_label} were fetched for this request. Use only facts present in these results. Do not invent prices, specifications, dates, or claims. Results can change. Cite the source names or links briefly when useful.']
+        for i,p in enumerate(products,1): lines.append(f'{i}. {p["title"]} | {p["snippet"]} | {p["url"]}')
+        product_context='\n'.join(lines)
+    elif is_product_request(search_text) or is_web_request(search_text):
+        product_context='LIVE WEB CONTEXT: No usable public-web results were retrieved. Do not claim to have current listings or news. Say live web results could not be retrieved.'
     messages=build_messages(text,language,session_id,product_context)
     try:
         provider=_configured_provider()
@@ -287,7 +341,7 @@ async def rime_tts(text):
 @app.get('/health')
 async def health():
     rime_key=os.getenv('RIME_API_KEY','').strip()
-    return {'ok':True,'stt':os.getenv('STT_PROVIDER','groq'),'llm':_configured_provider(),'rime_configured':bool(rime_key and rime_key != 'your_rime_api_key_here'),'product_search':'duckduckgo-web','memory_messages':HISTORY_MESSAGES,'memory_turns':HISTORY_MESSAGES // 2}
+    return {'ok':True,'stt':os.getenv('STT_PROVIDER','groq'),'llm':_configured_provider(),'rime_configured':bool(rime_key and rime_key != 'your_rime_api_key_here'),'web_search':'duckduckgo-with-bing-fallback','product_search':'duckduckgo-with-bing-fallback','memory_messages':HISTORY_MESSAGES,'memory_turns':HISTORY_MESSAGES // 2}
 
 @app.get('/memory')
 async def memory_status(session_id: str = 'local-demo'):

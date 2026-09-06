@@ -4,6 +4,8 @@ VOX is a voice-native prototype focused on **interruption and recovery**.
 
 Flow: microphone → speech recognition → FastAPI → AI → Rime TTS → audio.
 
+VOX can also answer the current time directly and add live public-web context for product searches and current technology or news questions. Product requests are searched with India-focused shopping terms; research requests are searched on the public web. Results are passed to the configured language model with instructions not to invent facts when live results are unavailable.
+
 ## Core behavior
 When the user changes a request while VOX is responding, the old task is invalidated and its result must not be played.
 
@@ -27,6 +29,8 @@ Do not start a separate frontend server on port 5500; the frontend resolves its 
 When VOX is launched inside a remote sandbox, `localhost:8000` is local to that sandbox and is not reachable from the user's own computer. Use the sandbox's forwarded/public port-8000 URL to open it externally. If running on your own computer, run the command above there and then open `http://localhost:8000` in that same computer's browser.
 
 Copy `.env.example` to `.env` and add real Rime configuration. Never commit `.env`.
+
+Set `VOX_TIMEZONE` to the IANA timezone you want for time answers; it defaults to `Asia/Kolkata`.
 
 ## Verified Rime Configuration
 
