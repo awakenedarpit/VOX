@@ -91,10 +91,43 @@ def current_time_answer(timezone_name=None):
     return f"It is {now.strftime('%I:%M %p').lstrip('0')} on {now.strftime('%A, %d %B %Y')} ({label})."
 
 def product_search_query(text):
-    return f'{" ".join(text.split())} India price specifications buy'
+    return f'{" ".join(text.split())} India current price listings buy'
+
+def extract_price_mentions(text):
+    """Extract visibly quoted prices without inventing or normalizing unknown currencies."""
+    if not text: return []
+    patterns=(
+        r'(?:₹|Rs\.?|INR\s*)\s?[\d,]+(?:\.\d{1,2})?',
+        r'\$\s?[\d,]+(?:\.\d{1,2})?',
+        r'€\s?[\d,]+(?:\.\d{1,2})?',
+        r'\b[\d,]+(?:\.\d{1,2})?\s?(?:INR|rupees)\b',
+    )
+    matches=[]
+    for pattern in patterns:
+        matches.extend(re.findall(pattern, text, flags=re.I))
+    return list(dict.fromkeys(' '.join(match.strip(' ,.;:').split()) for match in matches))
 
 async def search_products(text: str) -> list[dict]:
-    return await search_web(product_search_query(text))
+    structured=await search_structured_products(product_search_query(text))
+    return structured or await search_web(product_search_query(text))
+
+async def search_structured_products(query: str) -> list[dict]:
+    key=os.getenv('SERPAPI_API_KEY','').strip()
+    if not key or key == 'your_serpapi_key_here': return []
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+            r=await c.get('https://serpapi.com/search.json', params={'engine':'google_shopping','q':query,'location':'India','hl':'en','gl':'in','api_key':key})
+            r.raise_for_status(); data=r.json()
+        items=[]
+        for result in data.get('shopping_results',[])[:8]:
+            title=str(result.get('title') or '').strip(); url=str(result.get('link') or result.get('product_link') or '').strip()
+            price=str(result.get('price') or '').strip(); seller=str(result.get('source') or '').strip()
+            details=' | '.join(filter(None,[seller,price, str(result.get('snippet') or '').strip()]))
+            if title and url.startswith('http'): items.append({'title':title[:180],'url':url,'snippet':details[:500]})
+        return items
+    except Exception as exc:
+        logger.info('Structured product search unavailable: %s', str(exc)[:180])
+        return []
 
 async def search_web(query: str) -> list[dict]:
     headers={'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36'}
@@ -109,13 +142,19 @@ async def search_web(query: str) -> list[dict]:
         pass
     try:
         async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=headers) as c:
+            r=await c.get('https://www.bing.com/search', params={'q':query,'setlang':'en-IN'})
+            r.raise_for_status()
+        items=_parse_bing_results(r.text)
+        if items: return items
+    except Exception:
+        pass
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=headers) as c:
             r=await c.get('https://www.bing.com/search', params={'format':'rss','q':query,'setlang':'en-IN'})
             r.raise_for_status()
-        root=ElementTree.fromstring(r.text)
-        items=[]
+        root=ElementTree.fromstring(r.text); items=[]
         for item in root.findall('.//item'):
-            title=(item.findtext('title') or '').strip()
-            url=(item.findtext('link') or '').strip()
+            title=(item.findtext('title') or '').strip(); url=(item.findtext('link') or '').strip()
             snippet=re.sub(r'<[^>]+>','',html.unescape(item.findtext('description') or '')).strip()
             if title and url.startswith('http'): items.append({'title':title[:180],'url':url,'snippet':snippet[:500]})
             if len(items)>=8: break
@@ -137,6 +176,18 @@ def _parse_duckduckgo_results(page: str) -> list[dict]:
             snippet=html.unescape(re.sub(r'<[^>]+>','',sm.group(1))).strip() if sm else ''
             if title and raw_url.startswith('http'): items.append({'title':title[:180],'url':raw_url,'snippet':snippet[:500]})
             if len(items)>=8: break
+    return items
+
+def _parse_bing_results(page: str) -> list[dict]:
+    items=[]
+    for block in re.findall(r'<li[^>]+class="b_algo"[^>]*>(.*?)</li>', page, re.S|re.I):
+        link=re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, re.S|re.I)
+        if not link: continue
+        title=html.unescape(re.sub(r'<[^>]+>','',link.group(2))).strip(); url=html.unescape(link.group(1)).strip()
+        paragraph=re.search(r'<p[^>]*>(.*?)</p>', block, re.S|re.I)
+        snippet=html.unescape(re.sub(r'<[^>]+>','',paragraph.group(1))).strip() if paragraph else ''
+        if title and url.startswith('http'): items.append({'title':title[:180],'url':url,'snippet':snippet[:500]})
+        if len(items)>=8: break
     return items
 
 def remember_turn(session_id,user_text,assistant_text):
@@ -283,8 +334,13 @@ async def ask_ollama(text,language='en-IN',session_id='local-demo'):
     else:
         products=[]; context_label='web results'
     if products:
-        lines=[f'LIVE WEB CONTEXT: Current public-web {context_label} were fetched for this request. Use only facts present in these results. Do not invent prices, specifications, dates, or claims. Results can change. Cite the source names or links briefly when useful.']
-        for i,p in enumerate(products,1): lines.append(f'{i}. {p["title"]} | {p["snippet"]} | {p["url"]}')
+        fetched_at=datetime.now(ZoneInfo('UTC')).isoformat(timespec='seconds')
+        freshness='Prices and stock are live search-result observations, not guaranteed quotes. Tell the user to open the listing and verify the final price, delivery, seller, and availability before buying.' if is_product_request(search_text) else 'Results can change. Cite the source names or links briefly when useful.'
+        lines=[f'LIVE WEB CONTEXT: Current public-web {context_label} were fetched at {fetched_at} UTC. Use only facts present in these results. Do not invent prices, specifications, dates, or claims. {freshness}']
+        for i,p in enumerate(products,1):
+            prices=extract_price_mentions(f'{p["title"]} {p["snippet"]}')
+            price_text=f' | PRICE MENTIONS: {", ".join(prices)}' if prices else ' | PRICE MENTIONS: none visible in the result'
+            lines.append(f'{i}. {p["title"]} | {p["snippet"]}{price_text} | LISTING: {p["url"]}')
         product_context='\n'.join(lines)
     elif is_product_request(search_text) or is_web_request(search_text):
         product_context='LIVE WEB CONTEXT: No usable public-web results were retrieved. Do not claim to have current listings or news. Say live web results could not be retrieved.'
@@ -341,7 +397,9 @@ async def rime_tts(text):
 @app.get('/health')
 async def health():
     rime_key=os.getenv('RIME_API_KEY','').strip()
-    return {'ok':True,'stt':os.getenv('STT_PROVIDER','groq'),'llm':_configured_provider(),'rime_configured':bool(rime_key and rime_key != 'your_rime_api_key_here'),'web_search':'duckduckgo-with-bing-fallback','product_search':'duckduckgo-with-bing-fallback','memory_messages':HISTORY_MESSAGES,'memory_turns':HISTORY_MESSAGES // 2}
+    serp_key=os.getenv('SERPAPI_API_KEY','').strip()
+    structured=bool(serp_key and serp_key != 'your_serpapi_key_here')
+    return {'ok':True,'stt':os.getenv('STT_PROVIDER','groq'),'llm':_configured_provider(),'rime_configured':bool(rime_key and rime_key != 'your_rime_api_key_here'),'web_search':'duckduckgo-with-bing-fallback','product_search':'structured-shopping-plus-web-fallback','structured_product_search_configured':structured,'memory_messages':HISTORY_MESSAGES,'memory_turns':HISTORY_MESSAGES // 2}
 
 @app.get('/memory')
 async def memory_status(session_id: str = 'local-demo'):

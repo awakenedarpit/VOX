@@ -4,7 +4,9 @@ VOX is a voice-native prototype focused on **interruption and recovery**.
 
 Flow: microphone → speech recognition → FastAPI → AI → Rime TTS → audio.
 
-VOX can also answer the current time directly and add live public-web context for product searches and current technology or news questions. Product requests are searched with India-focused shopping terms; research requests are searched on the public web. Results are passed to the configured language model with instructions not to invent facts when live results are unavailable.
+VOX can also answer the current time directly and add live public-web context for product searches and current technology or news questions. Product requests are searched with India-focused shopping terms, including current price and listing queries; visible price mentions and listing URLs are passed to the assistant. Research requests are searched on the public web. Results are passed to the configured language model with instructions not to invent facts when live results are unavailable. Prices and stock can change, so VOX tells users to verify the final seller, delivery, availability, and checkout price before buying.
+
+For structured Google Shopping results with retailer names, normalized prices, and direct listing URLs, set the optional `SERPAPI_API_KEY`. Without it, VOX uses public search pages and reports only price mentions that are visibly present in those results; it never estimates a missing price.
 
 ## Core behavior
 When the user changes a request while VOX is responding, the old task is invalidated and its result must not be played.
