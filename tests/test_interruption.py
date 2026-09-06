@@ -2,8 +2,11 @@ import json
 import os
 import unittest
 import urllib.request
+from pathlib import Path
 
 from backend.main import _clean_voice_answer, current_time_answer, extract_price_mentions, is_time_request, is_web_request, product_search_query
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestVOXInterruption(unittest.TestCase):
@@ -22,6 +25,14 @@ class TestVOXInterruption(unittest.TestCase):
 
     def test_voice_answer_cleanup_removes_markdown_noise(self):
         self.assertEqual(_clean_voice_answer("**Answer:**\n- Fast.\n- Clear."), "Answer: Fast. Clear.")
+
+    def test_theme_toggle_is_wired_into_frontend(self):
+        html = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
+        script = (ROOT / "frontend" / "script.js").read_text(encoding="utf-8")
+        css = (ROOT / "frontend" / "style.css").read_text(encoding="utf-8")
+        self.assertIn('id="theme-toggle"', html)
+        self.assertIn("localStorage", script)
+        self.assertIn('data-theme="dark"', css)
 
     def test_new_task_is_newer(self):
         """Task IDs must be strictly monotonically increasing."""

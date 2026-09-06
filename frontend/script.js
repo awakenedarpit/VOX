@@ -11,6 +11,24 @@ const evalBtn = $('eval-btn'), exportBtn = $('export-eval-btn'), evalSummaryEl =
 const DEFAULT_SPEECH_LANGUAGE = 'en-IN';
 const connectionStatus = $('connection-status'), connectionLabel = $('connection-label');
 const memoryStatusEl = $('memory-status'), clearMemoryBtn = $('clear-memory-btn');
+const themeToggle = $('theme-toggle'), themeIcon = $('theme-icon'), themeLabel = $('theme-label');
+
+const THEME_STORAGE_KEY = 'vox-theme';
+function applyTheme(theme) {
+  const selected = theme === 'dark' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = selected;
+  try { window.localStorage?.setItem(THEME_STORAGE_KEY, selected); } catch (_) {}
+  const lightMode = selected === 'light';
+  if (themeToggle) themeToggle.setAttribute('aria-label', lightMode ? 'Switch to dark theme' : 'Switch to light theme');
+  if (themeToggle) themeToggle.title = lightMode ? 'Switch to dark theme' : 'Switch to light theme';
+  if (themeIcon) themeIcon.textContent = lightMode ? '☾' : '☼';
+  if (themeLabel) themeLabel.textContent = lightMode ? 'Dark mode' : 'Light mode';
+}
+function savedTheme() {
+  try { return window.localStorage?.getItem(THEME_STORAGE_KEY) || 'light'; } catch (_) { return 'light'; }
+}
+applyTheme(savedTheme());
+if (themeToggle) themeToggle.addEventListener('click', () => applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
 
 const SESSION_STORAGE_KEY = 'vox-service-session-id';
 function getSessionId() {
