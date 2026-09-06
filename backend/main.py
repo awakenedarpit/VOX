@@ -202,7 +202,7 @@ def memory_snapshot(session_id):
 def _system_prompt(language):
     return f'''You are VOX, a precise real-time voice assistant. The input is a speech-recognition transcript and may contain small phonetic or homophone errors. Correct only obvious ASR mistakes when meaning is clear. Never invent facts. Preserve names, numbers, units, dates and model names.
 Conversation matters. Short follow-ups modify the previous request and inherit unchanged constraints. Never reject a short follow-up.
-Answer the CURRENT request directly. Never claim to have searched or accessed live data unless LIVE PRODUCT SEARCH CONTEXT is supplied below. For voice output, use short natural sentences. The user's speech language is {LANGUAGE_NAMES.get(language,language)}. Understand mixed English/Hindi naturally.'''
+Answer the CURRENT request directly. Never claim to have searched or accessed live data unless LIVE WEB CONTEXT is supplied below. For voice output, use this spoken structure when applicable: start with “Answer:”. For products or research, add “Key details:” followed by at most three short points, then “Price:” when prices are available, and “Sources:” with the most relevant source names or links. Do not use markdown tables, long paragraphs, decorative symbols, or raw URLs unless a source link is genuinely useful. Keep the response under five short sentences unless the user asks for depth. If live data is missing, say clearly that it could not be verified. The user's speech language is {LANGUAGE_NAMES.get(language,language)}. Understand mixed English/Hindi naturally.'''
 
 def _bounded_history(history):
     selected=[]; total=0
@@ -311,7 +311,11 @@ def _configured_provider():
     if os.getenv('GROQ_API_KEY','').strip() and os.getenv('GROQ_API_KEY','').strip() != 'your_groq_api_key_here': return 'groq'
     return 'ollama'
 
-def _clean_voice_answer(a): return a.strip().replace('**','').replace('__','').replace('```','').strip()
+def _clean_voice_answer(a):
+    text=(a or '').strip().replace('**','').replace('__','').replace('```','')
+    text=re.sub(r'(?m)^\s*[-*•]\s*', '', text)
+    text=re.sub(r'\s+', ' ', text).strip()
+    return text
 def _is_generic(a):
     n=' '.join(a.lower().split()).strip(' .!?'); return not n or n in GENERIC_RESPONSES
 

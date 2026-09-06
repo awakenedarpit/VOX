@@ -3,7 +3,7 @@ import os
 import unittest
 import urllib.request
 
-from backend.main import current_time_answer, extract_price_mentions, is_time_request, is_web_request, product_search_query
+from backend.main import _clean_voice_answer, current_time_answer, extract_price_mentions, is_time_request, is_web_request, product_search_query
 
 
 class TestVOXInterruption(unittest.TestCase):
@@ -19,6 +19,9 @@ class TestVOXInterruption(unittest.TestCase):
     def test_product_search_requests_current_prices_and_extracts_mentions(self):
         self.assertIn("current price listings", product_search_query("best laptop under 60000"))
         self.assertEqual(extract_price_mentions("Now ₹59,999, down from Rs. 64,999"), ["₹59,999", "Rs. 64,999"])
+
+    def test_voice_answer_cleanup_removes_markdown_noise(self):
+        self.assertEqual(_clean_voice_answer("**Answer:**\n- Fast.\n- Clear."), "Answer: Fast. Clear.")
 
     def test_new_task_is_newer(self):
         """Task IDs must be strictly monotonically increasing."""
