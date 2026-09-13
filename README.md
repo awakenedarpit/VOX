@@ -73,3 +73,10 @@ VOX keeps up to 15 user-assistant turns for the current service tab session. Eac
 ## Credits & Contact
 
 VOX is created and maintained by **Arpit Raj** ([@awakenedarpit](https://github.com/awakenedarpit)). For questions, bug reports, or collaboration, contact Arpit through [GitHub](https://github.com/awakenedarpit) or open an issue in this repository.
+
+<!-- awakenedarpit-social-contact -->
+### Connect with Arpit
+
+- Instagram: [@awakenedarpit](https://www.instagram.com/awakenedarpit/)
+- LinkedIn: [Arpit Raj](https://www.linkedin.com/in/awakenedarpit/)
+- Email: [awakenedarpit@gmail.com](mailto:awakenedarpit@gmail.com)
