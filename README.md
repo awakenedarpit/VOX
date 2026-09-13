@@ -67,3 +67,9 @@ See `TESTING.md` for the manual acceptance procedure and metric definitions. Do 
 ## Conversation history
 
 VOX keeps up to 15 user-assistant turns for the current service tab session. Each tab receives a unique session ID through browser `sessionStorage`, so separate tabs, browsers, devices, or browser profiles receive separate histories. Reloading the same tab restores its active service history; closing the tab starts a new service history. The backend stores the recent turns locally in `backend/data/conversation_history.json`, which is ignored by Git.
+
+
+<!-- awakenedarpit-credits-contact -->
+## Credits & Contact
+
+VOX is created and maintained by **Arpit Raj** ([@awakenedarpit](https://github.com/awakenedarpit)). For questions, bug reports, or collaboration, contact Arpit through [GitHub](https://github.com/awakenedarpit) or open an issue in this repository.
