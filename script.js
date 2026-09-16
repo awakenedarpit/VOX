@@ -77,6 +77,7 @@ let vadFrame = null;
 let vadActive = false;
 let vadHits = 0;
 let lastVadInterruption = 0;
+let vadSpeechStartedAt = 0;
 
 // Chrome SpeechRecognition can return phonetic variants for technical phrases.
 // Keep corrections conservative and phrase-based so ordinary dictation is not
@@ -236,9 +237,18 @@ async function startVoiceActivityMonitor() {
       for (let i = 0; i < samples.length; i += 1) { const deviation = (samples[i] - 128) / 128; energy += deviation * deviation; }
       const rms = Math.sqrt(energy / samples.length);
       const responseActive = currentState === 'SPEAKING' || currentState === 'THINKING';
-      if (responseActive && rms > 0.045) vadHits += 1; else vadHits = Math.max(0, vadHits - 1);
-      if (responseActive && recognitionRunning && vadHits >= 3 && performance.now() - lastVadInterruption > 900) {
+      const now = performance.now();
+      if (responseActive && recognitionRunning && rms > 0.055) {
+        if (!vadSpeechStartedAt) vadSpeechStartedAt = now;
+        vadHits = Math.min(12, vadHits + 1);
+      } else {
+        vadHits = Math.max(0, vadHits - 2);
+        if (vadHits === 0) vadSpeechStartedAt = 0;
+      }
+      const sustainedSpeech = vadSpeechStartedAt > 0 && now - vadSpeechStartedAt >= 180;
+      if (responseActive && recognitionRunning && sustainedSpeech && vadHits >= 6 && now - lastVadInterruption > 1400) {
         lastVadInterruption = performance.now(); vadHits = 0;
+        vadSpeechStartedAt = 0;
         recordEvent('voice_activity_barge_in', { rms: Number(rms.toFixed(4)) });
         beginInterruption('Voice activity detected');
       }
