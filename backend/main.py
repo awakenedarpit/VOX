@@ -32,6 +32,18 @@ _provider_gate = asyncio.Semaphore(2)
 allowed_origins = [origin.strip() for origin in os.getenv('VOX_ALLOWED_ORIGINS', '*').split(',') if origin.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=['*'], allow_headers=['*'])
 
+@app.middleware('http')
+async def strip_vercel_api_prefix(request, call_next):
+    # Vercel may pass the /api function prefix through to the ASGI app.
+    # VOX endpoints are also exposed at the root for local development.
+    path = request.scope.get('path', '')
+    if path == '/api' or path.startswith('/api/'):
+        request.scope['path'] = path[4:] or '/'
+        raw_path = request.scope.get('raw_path', b'')
+        if raw_path.startswith(b'/api'):
+            request.scope['raw_path'] = raw_path[4:] or b'/'
+    return await call_next(request)
+
 class ChatRequest(BaseModel):
     text: str
     task_id: int
