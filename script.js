@@ -237,7 +237,7 @@ async function startVoiceActivityMonitor() {
       const rms = Math.sqrt(energy / samples.length);
       const responseActive = currentState === 'SPEAKING' || currentState === 'THINKING';
       if (responseActive && rms > 0.045) vadHits += 1; else vadHits = Math.max(0, vadHits - 1);
-      if (responseActive && vadHits >= 3 && performance.now() - lastVadInterruption > 900) {
+      if (responseActive && recognitionRunning && vadHits >= 3 && performance.now() - lastVadInterruption > 900) {
         lastVadInterruption = performance.now(); vadHits = 0;
         recordEvent('voice_activity_barge_in', { rms: Number(rms.toFixed(4)) });
         beginInterruption('Voice activity detected');
@@ -288,7 +288,17 @@ function beginInterruption(reason = 'Voice barge-in detected') {
   pendingRecovery = { trial_id: interruptionTrials.length + 1, interrupted_task_id: oldTask, new_task_id: currentTaskId, interruption_detected_at: detected, cutoff_latency_ms: cutoff, recovery_time_ms: null, stale_results: 0, recovery_success: null, reason };
   interruptionTrials.push(pendingRecovery); if (taskMetric) taskMetric.textContent = `#${currentTaskId}`;
   recordEvent('interruption_detected', { reason, interrupted_task_id: oldTask }); recordEvent('task_invalidated', { invalidated_task_id: oldTask });
-  setState('INTERRUPTED', 'Previous response stopped. Listening for your new instruction…'); return currentTaskId;
+  // Stay in a speech-recognition-ready state immediately. A VAD trigger can
+  // be caused by speaker echo and must never leave the UI waiting forever for
+  // a final transcript that may not arrive.
+  setState(isMicActive ? 'LISTENING' : 'IDLE', isMicActive ? 'Listening for your new instruction…' : 'Ready.');
+  window.setTimeout(() => {
+    if (currentTaskId === bargeInTask && currentState === 'LISTENING' && !finalBuffer) {
+      recordEvent('interruption_capture_timeout', { task_id: currentTaskId });
+      setState(isMicActive ? 'LISTENING' : 'IDLE', isMicActive ? 'Listening…' : 'Ready.');
+    }
+  }, 1800);
+  return currentTaskId;
 }
 function interrupt(reason = 'Manual interruption') { return beginInterruption(reason); }
 
