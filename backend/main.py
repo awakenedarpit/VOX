@@ -29,7 +29,8 @@ logger = logging.getLogger('vox')
 UPSTREAM_RETRIES = max(1, int(os.getenv('VOX_UPSTREAM_RETRIES', '3')))
 HISTORY_CONTEXT_CHARS = max(4000, int(os.getenv('VOX_HISTORY_CONTEXT_CHARS', '12000')))
 _provider_gate = asyncio.Semaphore(2)
-app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
+allowed_origins = [origin.strip() for origin in os.getenv('VOX_ALLOWED_ORIGINS', '*').split(',') if origin.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=['*'], allow_headers=['*'])
 
 class ChatRequest(BaseModel):
     text: str

@@ -1,0 +1,5 @@
+[tool.vercel]
+entrypoint = "backend.main:app"
+
+[tool.vercel.scripts]
+build = "echo VOX FastAPI deployment"
