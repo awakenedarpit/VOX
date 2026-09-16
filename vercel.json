@@ -1,7 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "api/[...path].py": {
+    "api/*.py": {
+      "maxDuration": 300,
+      "excludeFiles": "{tests/**,backend/.venv/**,backend/data/**,**/*.swp}"
+    },
+    "api/memory/*.py": {
       "maxDuration": 300,
       "excludeFiles": "{tests/**,backend/.venv/**,backend/data/**,**/*.swp}"
     }
