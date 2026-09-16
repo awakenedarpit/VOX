@@ -1,9 +1,16 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "backend/main.py": {
+    "api/index.py": {
       "maxDuration": 300,
       "excludeFiles": "{tests/**,backend/.venv/**,backend/data/**,**/*.swp}"
     }
-  }
+  },
+  "rewrites": [
+    { "source": "/health", "destination": "/api/health" },
+    { "source": "/memory", "destination": "/api/memory" },
+    { "source": "/memory/history", "destination": "/api/memory/history" },
+    { "source": "/chat", "destination": "/api/chat" },
+    { "source": "/transcribe", "destination": "/api/transcribe" }
+  ]
 }
