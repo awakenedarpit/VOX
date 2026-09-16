@@ -69,6 +69,9 @@ let finalTimer = null;
 let lastSubmittedTranscript = '';
 let bargeInTask = null;
 let recognitionRestartAttempts = 0;
+let recognitionWatchdog = null;
+let lastRecognitionResultAt = 0;
+let lastSubmittedTranscriptAt = 0;
 let interruptionCaptureUntil = 0;
 let micStream = null;
 let vadContext = null;
@@ -172,7 +175,8 @@ function isEcho(text) {
 }
 function acceptable(text) {
   const t = text.trim().replace(/\s+/g, ' ');
-  if (!t || performance.now() < ignoreRecognitionUntil || t === lastSubmittedTranscript) return false;
+  const duplicateWindow = performance.now() - lastSubmittedTranscriptAt < 1200;
+  if (!t || performance.now() < ignoreRecognitionUntil || (duplicateWindow && t === lastSubmittedTranscript)) return false;
   if (isEcho(t)) { recordEvent('recognition_echo_ignored', { text_length: t.length }); return false; }
   return true;
 }
@@ -215,6 +219,28 @@ function stopVoiceActivityMonitor() {
   if (vadContext) { vadContext.close().catch(() => {}); vadContext = null; }
   if (micStream) { micStream.getTracks().forEach(track => track.stop()); micStream = null; }
   vadAnalyser = null; vadHits = 0;
+}
+
+function stopRecognitionWatchdog() {
+  if (recognitionWatchdog) clearInterval(recognitionWatchdog);
+  recognitionWatchdog = null;
+}
+
+function startRecognitionWatchdog() {
+  stopRecognitionWatchdog();
+  lastRecognitionResultAt = performance.now();
+  recognitionWatchdog = window.setInterval(() => {
+    if (!isMicActive || !recognition || !recognitionRunning) return;
+    // Chrome can leave SpeechRecognition marked as running after a silent
+    // provider/network failure. Reset it for subsequent voice trials.
+    if (performance.now() - lastRecognitionResultAt > 15000 && currentState === 'LISTENING') {
+      recordEvent('speech_recognition_watchdog_restart');
+      recognitionRunning = false;
+      try { recognition.abort(); } catch (_) {}
+      recognitionRestartAttempts = 0;
+      restartRecognition();
+    }
+  }, 3000);
 }
 
 async function startVoiceActivityMonitor() {
@@ -316,7 +342,7 @@ async function sendQuery(text) {
   const cleaned = text.trim().replace(/\s+/g, ' ');
   const recovery = pendingRecovery && pendingRecovery.new_task_id === currentTaskId && pendingRecovery.recovery_success === null;
   if (!cleaned || (!recovery && !acceptable(cleaned))) return;
-  lastSubmittedTranscript = cleaned; clearError();
+  lastSubmittedTranscript = cleaned; lastSubmittedTranscriptAt = performance.now(); clearError();
   const taskId = recovery ? currentTaskId : ++currentTaskId;
   if (taskMetric) taskMetric.textContent = `#${taskId}`; bargeInTask = null; activeResponseText = '';
   recordEvent('task_created', { task_id_created: taskId, input_source: 'browser-speech-recognition', speech_language: language(), recovery_task: recovery, api_base: API_BASE });
@@ -415,6 +441,7 @@ function setupSpeechRecognition() {
   recognition.onend = () => { recognitionRunning = false; recordEvent('speech_recognition_ended'); restartRecognition(); };
   recognition.onerror = (e) => { recognitionRunning = false; recordEvent('speech_recognition_error', { error: e.error }); if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { isMicActive = false; showError('Microphone permission was denied. Allow microphone access for this site.'); setState('IDLE', 'Allow microphone access and try again.'); return; } if (e.error !== 'aborted' && e.error !== 'no-speech') showError(`Speech recognition error: ${e.error}`); recognitionRestartAttempts += 1; restartRecognition(); };
   recognition.onresult = (event) => {
+    lastRecognitionResultAt = performance.now();
     let interim = '', finalText = '';
     for (let i = event.resultIndex; i < event.results.length; i += 1) { const result = event.results[i]; const best = selectRecognitionTranscript(result); if (result.isFinal) finalText += `${best} `; else interim += `${best} `; }
     const candidate = correctTechnicalTranscript((finalText || interim).trim());
@@ -427,8 +454,8 @@ function setupSpeechRecognition() {
   return true;
 }
 
-function startListening() { clearError(); if (!recognition && !setupSpeechRecognition()) return; isMicActive = true; startVoiceActivityMonitor(); recognition.lang = language(); setState('LISTENING', 'Listening… speak normally.'); try { if (!recognitionRunning) recognition.start(); } catch (_) { recognitionRestartAttempts += 1; restartRecognition(); } }
-function stopListening() { isMicActive = false; clearTimeout(restartTimer); restartTimer = null; clearTimeout(finalTimer); finalBuffer = ''; recognitionRestartAttempts = 0; stopVoiceActivityMonitor(); if (recognition) { try { recognition.stop(); } catch (_) {} } recognitionRunning = false; stopAudio(); setState('IDLE', 'Ready.'); }
+function startListening() { clearError(); if (!recognition && !setupSpeechRecognition()) return; isMicActive = true; startRecognitionWatchdog(); startVoiceActivityMonitor(); recognition.lang = language(); setState('LISTENING', 'Listening… speak normally.'); try { if (!recognitionRunning) recognition.start(); } catch (_) { recognitionRestartAttempts += 1; restartRecognition(); } }
+function stopListening() { isMicActive = false; stopRecognitionWatchdog(); clearTimeout(restartTimer); restartTimer = null; clearTimeout(finalTimer); finalBuffer = ''; recognitionRestartAttempts = 0; stopVoiceActivityMonitor(); if (recognition) { try { recognition.stop(); } catch (_) {} } recognitionRunning = false; stopAudio(); setState('IDLE', 'Ready.'); }
 
 if (micBtn) micBtn.addEventListener('click', () => isMicActive ? stopListening() : startListening());
 if (stopBtn) stopBtn.addEventListener('click', () => interrupt());
